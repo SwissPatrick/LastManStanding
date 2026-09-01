@@ -1,0 +1,417 @@
+{
+  "matches_per_season": {
+    "2010/11": 380,
+    "2011/12": 380,
+    "2012/13": 380,
+    "2013/14": 380,
+    "2014/15": 380,
+    "2015/16": 380,
+    "2016/17": 380,
+    "2017/18": 380,
+    "2018/19": 380,
+    "2019/20": 380,
+    "2020/21": 380,
+    "2021/22": 380,
+    "2022/23": 380,
+    "2023/24": 380,
+    "2024/25": 380,
+    "2025/26": 380
+  },
+  "missing_results": 1,
+  "missing_odds": 0,
+  "invalid_decimal_odds": 0,
+  "duplicate_fixtures": 0,
+  "unrecognised_team_names": [],
+  "promoted_relegated": {
+    "2011/12": {
+      "promoted": [
+        "Norwich",
+        "QPR",
+        "Swansea"
+      ],
+      "relegated": [
+        "Birmingham",
+        "Blackpool",
+        "West Ham"
+      ]
+    },
+    "2012/13": {
+      "promoted": [
+        "Reading",
+        "Southampton",
+        "West Ham"
+      ],
+      "relegated": [
+        "Blackburn",
+        "Bolton",
+        "Wolverhampton Wanderers"
+      ]
+    },
+    "2013/14": {
+      "promoted": [
+        "Cardiff",
+        "Crystal Palace",
+        "Hull"
+      ],
+      "relegated": [
+        "QPR",
+        "Reading",
+        "Wigan"
+      ]
+    },
+    "2014/15": {
+      "promoted": [
+        "Burnley",
+        "Leicester",
+        "QPR"
+      ],
+      "relegated": [
+        "Cardiff",
+        "Fulham",
+        "Norwich"
+      ]
+    },
+    "2015/16": {
+      "promoted": [
+        "Bournemouth",
+        "Norwich",
+        "Watford"
+      ],
+      "relegated": [
+        "Burnley",
+        "Hull",
+        "QPR"
+      ]
+    },
+    "2016/17": {
+      "promoted": [
+        "Burnley",
+        "Hull",
+        "Middlesbrough"
+      ],
+      "relegated": [
+        "Aston Villa",
+        "Newcastle",
+        "Norwich"
+      ]
+    },
+    "2017/18": {
+      "promoted": [
+        "Brighton",
+        "Huddersfield",
+        "Newcastle"
+      ],
+      "relegated": [
+        "Hull",
+        "Middlesbrough",
+        "Sunderland"
+      ]
+    },
+    "2018/19": {
+      "promoted": [
+        "Cardiff",
+        "Fulham",
+        "Wolverhampton Wanderers"
+      ],
+      "relegated": [
+        "Stoke",
+        "Swansea",
+        "West Brom"
+      ]
+    },
+    "2019/20": {
+      "promoted": [
+        "Aston Villa",
+        "Norwich",
+        "Sheffield United"
+      ],
+      "relegated": [
+        "Cardiff",
+        "Fulham",
+        "Huddersfield"
+      ]
+    },
+    "2020/21": {
+      "promoted": [
+        "Fulham",
+        "Leeds",
+        "West Brom"
+      ],
+      "relegated": [
+        "Bournemouth",
+        "Norwich",
+        "Watford"
+      ]
+    },
+    "2021/22": {
+      "promoted": [
+        "Brentford",
+        "Norwich",
+        "Watford"
+      ],
+      "relegated": [
+        "Fulham",
+        "Sheffield United",
+        "West Brom"
+      ]
+    },
+    "2022/23": {
+      "promoted": [
+        "Bournemouth",
+        "Fulham",
+        "Nott'm Forest"
+      ],
+      "relegated": [
+        "Burnley",
+        "Norwich",
+        "Watford"
+      ]
+    },
+    "2023/24": {
+      "promoted": [
+        "Burnley",
+        "Luton",
+        "Sheffield United"
+      ],
+      "relegated": [
+        "Leeds",
+        "Leicester",
+        "Southampton"
+      ]
+    },
+    "2024/25": {
+      "promoted": [
+        "Ipswich",
+        "Leicester",
+        "Southampton"
+      ],
+      "relegated": [
+        "Burnley",
+        "Luton",
+        "Sheffield United"
+      ]
+    },
+    "2025/26": {
+      "promoted": [
+        "Burnley",
+        "Leeds",
+        "Sunderland"
+      ],
+      "relegated": [
+        "Ipswich",
+        "Leicester",
+        "Southampton"
+      ]
+    }
+  },
+  "suspicious_scores": [],
+  "odds_overround": {
+    "count": 6080,
+    "mean": 0.047498123319624684,
+    "p95": 0.06189658352300011
+  },
+  "bookmaker_coverage": {
+    "2010/11": {
+      "market-average-closing": 0,
+      "market-average-timestamp-unknown": 380
+    },
+    "2011/12": {
+      "market-average-closing": 0,
+      "market-average-timestamp-unknown": 380
+    },
+    "2012/13": {
+      "market-average-closing": 0,
+      "market-average-timestamp-unknown": 380
+    },
+    "2013/14": {
+      "market-average-closing": 0,
+      "market-average-timestamp-unknown": 380
+    },
+    "2014/15": {
+      "market-average-closing": 0,
+      "market-average-timestamp-unknown": 380
+    },
+    "2015/16": {
+      "market-average-closing": 0,
+      "market-average-timestamp-unknown": 380
+    },
+    "2016/17": {
+      "market-average-closing": 0,
+      "market-average-timestamp-unknown": 380
+    },
+    "2017/18": {
+      "market-average-closing": 0,
+      "market-average-timestamp-unknown": 380
+    },
+    "2018/19": {
+      "market-average-closing": 0,
+      "market-average-timestamp-unknown": 380
+    },
+    "2019/20": {
+      "market-average-closing": 380,
+      "market-average-timestamp-unknown": 0
+    },
+    "2020/21": {
+      "market-average-closing": 380,
+      "market-average-timestamp-unknown": 0
+    },
+    "2021/22": {
+      "market-average-closing": 380,
+      "market-average-timestamp-unknown": 0
+    },
+    "2022/23": {
+      "market-average-closing": 380,
+      "market-average-timestamp-unknown": 0
+    },
+    "2023/24": {
+      "market-average-closing": 380,
+      "market-average-timestamp-unknown": 0
+    },
+    "2024/25": {
+      "market-average-closing": 380,
+      "market-average-timestamp-unknown": 0
+    },
+    "2025/26": {
+      "market-average-closing": 380,
+      "market-average-timestamp-unknown": 0
+    }
+  },
+  "opening_vs_closing": {
+    "opening": 0,
+    "closing": 2660,
+    "intermediate": 0,
+    "timestamp-unknown": 3420
+  },
+  "source_rows": {
+    "2010/11": 380,
+    "2011/12": 380,
+    "2012/13": 380,
+    "2013/14": 380,
+    "2014/15": 381,
+    "2015/16": 380,
+    "2016/17": 380,
+    "2017/18": 380,
+    "2018/19": 380,
+    "2019/20": 380,
+    "2020/21": 380,
+    "2021/22": 380,
+    "2022/23": 380,
+    "2023/24": 380,
+    "2024/25": 380,
+    "2025/26": 380
+  },
+  "import_reports": [
+    {
+      "season": "2010/11",
+      "matches": 380,
+      "missing": 0,
+      "duplicates": 0,
+      "invalid": 0
+    },
+    {
+      "season": "2011/12",
+      "matches": 380,
+      "missing": 0,
+      "duplicates": 0,
+      "invalid": 0
+    },
+    {
+      "season": "2012/13",
+      "matches": 380,
+      "missing": 0,
+      "duplicates": 0,
+      "invalid": 0
+    },
+    {
+      "season": "2013/14",
+      "matches": 380,
+      "missing": 0,
+      "duplicates": 0,
+      "invalid": 0
+    },
+    {
+      "season": "2014/15",
+      "matches": 380,
+      "missing": 1,
+      "duplicates": 0,
+      "invalid": 0
+    },
+    {
+      "season": "2015/16",
+      "matches": 380,
+      "missing": 0,
+      "duplicates": 0,
+      "invalid": 0
+    },
+    {
+      "season": "2016/17",
+      "matches": 380,
+      "missing": 0,
+      "duplicates": 0,
+      "invalid": 0
+    },
+    {
+      "season": "2017/18",
+      "matches": 380,
+      "missing": 0,
+      "duplicates": 0,
+      "invalid": 0
+    },
+    {
+      "season": "2018/19",
+      "matches": 380,
+      "missing": 0,
+      "duplicates": 0,
+      "invalid": 0
+    },
+    {
+      "season": "2019/20",
+      "matches": 380,
+      "missing": 0,
+      "duplicates": 0,
+      "invalid": 0
+    },
+    {
+      "season": "2020/21",
+      "matches": 380,
+      "missing": 0,
+      "duplicates": 0,
+      "invalid": 0
+    },
+    {
+      "season": "2021/22",
+      "matches": 380,
+      "missing": 0,
+      "duplicates": 0,
+      "invalid": 0
+    },
+    {
+      "season": "2022/23",
+      "matches": 380,
+      "missing": 0,
+      "duplicates": 0,
+      "invalid": 0
+    },
+    {
+      "season": "2023/24",
+      "matches": 380,
+      "missing": 0,
+      "duplicates": 0,
+      "invalid": 0
+    },
+    {
+      "season": "2024/25",
+      "matches": 380,
+      "missing": 0,
+      "duplicates": 0,
+      "invalid": 0
+    },
+    {
+      "season": "2025/26",
+      "matches": 380,
+      "missing": 0,
+      "duplicates": 0,
+      "invalid": 0
+    }
+  ]
+}

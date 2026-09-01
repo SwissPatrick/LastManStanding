@@ -1,0 +1,35 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+**/*credentials*
+**/*token*
+**/*secret*
+streamlit_secrets.toml
+.streamlit/secrets.toml
+
+# Python, IDE and OS artefacts
+.venv/
+venv/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local databases and private output
+*.sqlite
+*.sqlite3
+*.db
+reports/private/
+data/raw/
+data/downloads/
+data/repro_run*/
+data/historical_cartel_cohorts.csv
+data/historical_cartel_decisions.csv
+data/historical_cartel_evaluation.json
+data/round_construction_audit.csv
+*.tmp
+*.log
