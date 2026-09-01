@@ -13,6 +13,7 @@ streamlit_secrets.toml
 venv/
 __pycache__/
 .pytest_cache/
+.pytest-temp/
 .mypy_cache/
 .ruff_cache/
 .idea/
@@ -35,6 +36,7 @@ data/fixture_audit/
 data/historical_cartel_evaluation_cvar/
 data/heterogeneous_cartel_evaluation/
 data/provider_cache/
+data/benchmarks/
 data/forecasts/
 data/recommendations/
 *.tmp

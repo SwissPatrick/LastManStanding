@@ -18,6 +18,7 @@ def run() -> None:
     from .weekly import RecommendationSnapshot, WeeklyStore
     from .forecast_snapshot import ForecastStore
     from .providers import OddsApiProvider, ProviderError
+    from .performance import PerformanceConfig, SimulationJobService, detect_hardware, effective_thread_configuration, performance_profiles
     from .workflow import LMSWorkflow
     st.set_page_config(page_title="LMS Weekly Manager", layout="wide")
     st.title("Premier League Last Man Standing")
@@ -25,6 +26,8 @@ def run() -> None:
     repo = Repository(Path("data/lms.sqlite3")); service = LMSWorkflow(repo)
     steps = ["Season and round", "Fixtures and odds", "Players and entries", "Validate round", "Analyse", "Review selections", "Lock and share", "Record results"]
     st.session_state.setdefault("step", 0); st.session_state.setdefault("analysis", None); st.session_state.setdefault("locked", False)
+    if "simulation_jobs" not in st.session_state:
+        st.session_state.simulation_jobs = SimulationJobService()
     season = st.session_state.get("season", "2026/27"); round_number = int(st.session_state.get("round_number", 1))
     st.progress((st.session_state.step + 1) / len(steps), text=f"Step {st.session_state.step + 1} of {len(steps)} · {steps[st.session_state.step]}")
     st.write("Completed:", " · ".join(steps[:st.session_state.step]) or "none")
@@ -46,7 +49,16 @@ def run() -> None:
         with st.form("round_form"):
             round_number = int(st.number_input("Round number", min_value=1, value=round_number)); deadline_date = st.date_input("Selection deadline date"); deadline_time = st.time_input("Selection deadline time", value=time(12, 0))
             if st.form_submit_button("Create / update round"):
-                try: service.create_round(Round(season=season, round_number=round_number, selection_deadline=datetime.combine(deadline_date, deadline_time, tzinfo=timezone.utc))); st.session_state.update(season=season, round_number=round_number); st.success("Round saved.")
+                try:
+                    previous_round = (st.session_state.get("season"), st.session_state.get("round_number"))
+                    service.create_round(Round(season=season, round_number=round_number, selection_deadline=datetime.combine(deadline_date, deadline_time, tzinfo=timezone.utc)))
+                    st.session_state.update(season=season, round_number=round_number)
+                    if previous_round != (season, round_number):
+                        st.session_state.locked = False
+                        st.session_state.pop("snapshot", None)
+                        st.session_state.analysis = None
+                        st.session_state.validation = False
+                    st.success("Round saved.")
                 except Exception as exc: st.error(str(exc))
         st.info("Configured local timezone: UTC. Deadlines are timezone-aware.")
         if st.button("Load deterministic historical dry-run"):
@@ -149,6 +161,39 @@ def run() -> None:
         analysis = st.session_state.analysis
         if analysis:
             risk = analysis["risk"]; st.dataframe(pd.DataFrame(analysis["probabilities"]), use_container_width=True); st.json({k: risk[k] for k in ("expected_survivors", "probability_at_least_one", "wipeout_probability", "cvar", "survivor_counts", "probabilities")}); st.dataframe(pd.DataFrame([{"Entry": e, "Recommended": t, "Backup": analysis["backups"].get(e)} for e, t in analysis["allocation"].items()]), use_container_width=True); st.caption("Risk is exact conditional on supplied fair probabilities; future values are model forecasts.")
+            hardware = detect_hardware(); profiles = performance_profiles(hardware)
+            with st.expander("Adaptive CPU simulation", expanded=False):
+                profile_name = st.selectbox("Performance profile", ["Quick", "Standard", "Deep", "Maximum", "Custom"], index=1)
+                profile = profiles.get(profile_name, profiles["Standard"])
+                if profile_name == "Custom":
+                    minimum_runs = int(st.number_input("Minimum simulations", min_value=1, value=profile.minimum_runs, step=1000))
+                    maximum_runs = int(st.number_input("Maximum simulations", min_value=minimum_runs, value=profile.maximum_runs, step=1000))
+                    batch_size = int(st.number_input("Batch size", min_value=1, value=profile.batch_size, step=1000))
+                    standard_error = float(st.number_input("Standard-error target", min_value=.000001, value=profile.target_standard_error, format="%.6f"))
+                    confidence_width = float(st.number_input("Confidence-width target", min_value=.000001, value=profile.target_ci_width, format="%.6f"))
+                else:
+                    minimum_runs, maximum_runs, batch_size, standard_error, confidence_width = profile.minimum_runs, profile.maximum_runs, profile.batch_size, profile.target_standard_error, profile.target_ci_width
+                worker_count = int(st.number_input("Process workers", min_value=1, max_value=hardware.safe_logical_limit, value=profile.workers))
+                seed = int(st.number_input("Simulation seed", min_value=0, value=profile.seed))
+                config = PerformanceConfig(profile_name, minimum_runs, maximum_runs, batch_size, standard_error, confidence_width, worker_count, seed)
+                st.json({"hardware": hardware.__dict__, "configuration": config.as_dict(), "thread_configuration": {**effective_thread_configuration(), "configured_process_workers": worker_count, "execution": "CPU-accelerated"}})
+                if st.button("Start adaptive simulation"):
+                    try:
+                        inputs = service.simulation_inputs(round_number)
+                        job_id = st.session_state.simulation_jobs.start(analysis["allocation"], [inputs], config)
+                        st.session_state.simulation_job_id = job_id; st.success("Simulation job started in the background.")
+                    except Exception as exc: st.error(str(exc))
+                job_id = st.session_state.get("simulation_job_id")
+                if job_id:
+                    status = st.session_state.simulation_jobs.status(job_id)
+                    st.write(f"State: {status['state']} · simulations: {status.get('simulations', 0)} / {status.get('maximum_runs')} · {status.get('simulations_per_second', 0):.0f} simulations/s · elapsed: {status['elapsed_seconds']:.1f}s")
+                    st.json({"convergence": status.get("progress", {}), "active_workers": status.get("active_workers", 0), "resources": status.get("resources", {})})
+                    if status["state"] == "running":
+                        if st.button("Cancel simulation"): st.session_state.simulation_jobs.cancel(job_id); st.rerun()
+                        if st.button("Refresh simulation progress"): st.rerun()
+                    if status.get("error"): st.error("Simulation failed: " + str(status["error"]))
+                    if status.get("summary") is not None:
+                        summary = status["summary"]; st.json({"simulations": summary.simulations, "converged": summary.converged, "stopping_reason": summary.stopping_reason, "standard_errors": summary.standard_errors, "confidence_interval_widths": summary.confidence_interval_widths})
         if st.button("Continue to review", key="next4", disabled=analysis is None): go(5)
     with tabs[5]:
         st.header("6. Review selections — Selections and backups"); analysis = st.session_state.analysis
@@ -169,7 +214,7 @@ def run() -> None:
                     if left != right: st.json(WeeklyStore.compare(next(item for item in versions if item.version == left), next(item for item in versions if item.version == right)))
             if st.button("Save recommendation snapshot", disabled=st.session_state.locked):
                 try:
-                    version = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ"); snap = RecommendationSnapshot(version=version, created_at=datetime.now(timezone.utc), season=season, round_number=round_number, odds_snapshot_version=f"manual-odds-{len(service.odds())}", forecast_snapshot_version=st.session_state.get("forecast_version", "not-required"), active_entries=list(analysis["allocation"]), used_teams={e: service.used_teams(e) for e in analysis["allocation"]}, objective_weights=analysis["objective_weights"], exposure_limits={}, simulation_settings={}, seed=7, optimiser_version="weekly-service", allocation=analysis["allocation"], backups=analysis["backups"], odds_snapshot={q.fixture_id: q.model_dump() for q in service.odds()}, probabilities={row["team"]: row["proportional"] for row in analysis["probabilities"]}, exact_risk=analysis["risk"], risk_estimates={"expected_survivors": float(analysis["risk"]["expected_survivors"])}); WeeklyStore().save(snap); st.session_state.snapshot = snap; st.success("Immutable recommendation snapshot saved.")
+                    version = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ"); snap = RecommendationSnapshot(version=version, created_at=datetime.now(timezone.utc), season=season, round_number=round_number, odds_snapshot_version=f"manual-odds-{len(service.odds())}", forecast_snapshot_version=st.session_state.get("forecast_version", "not-required"), active_entries=list(analysis["allocation"]), used_teams={e: service.used_teams(e) for e in analysis["allocation"]}, objective_weights=analysis["objective_weights"], exposure_limits={}, simulation_settings={}, seed=7, optimiser_version="weekly-service", allocation=analysis["allocation"], backups=analysis["backups"], odds_snapshot={q.fixture_id: q.model_dump() for q in service.odds()}, probabilities={row["team"]: row["proportional"] for row in analysis["probabilities"]}, exact_risk={key: (value.tolist() if hasattr(value, "tolist") else value) for key, value in analysis["risk"].items()}, risk_estimates={"expected_survivors": float(analysis["risk"]["expected_survivors"]) }); WeeklyStore().save(snap); st.session_state.snapshot = snap; st.success("Immutable recommendation snapshot saved.")
                 except Exception as exc: st.error(str(exc))
             if st.button("Lock picks", disabled=st.session_state.locked or "snapshot" not in st.session_state):
                 try:

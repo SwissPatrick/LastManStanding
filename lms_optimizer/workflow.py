@@ -209,6 +209,17 @@ class LMSWorkflow:
                 counts[selection["team"]] += 1
         return dict(sorted(counts.items()))
 
+    def simulation_inputs(self, round_number: int) -> tuple[dict[str, np.ndarray], dict[str, tuple[str, str]]]:
+        """Return service-owned probabilities and fixture teams for execution."""
+        fixture_probabilities: dict[str, np.ndarray] = {}
+        fixture_teams: dict[str, tuple[str, str]] = {}
+        for fixture in eligible_fixtures(self.fixtures(), round_number):
+            quotes = [q for q in self.odds() if q.fixture_id == fixture.fixture_id]
+            consensus = [sum(getattr(q, side) for q in quotes) / len(quotes) for side in ("home", "draw", "away")]
+            fixture_probabilities[fixture.fixture_id] = proportional(consensus)
+            fixture_teams[fixture.fixture_id] = (fixture.home_team, fixture.away_team)
+        return fixture_probabilities, fixture_teams
+
     def record_fixture_status(self, fixture_id: str, status: FixtureStatus, home_goals: int | None = None, away_goals: int | None = None) -> None:
         fixtures = self.fixtures()
         target = next((f for f in fixtures if f.fixture_id == fixture_id), None)
@@ -260,11 +271,7 @@ class LMSWorkflow:
         for entry in entries:
             teams = sorted(self.available_teams(entry.entry_id, round_number), key=lambda team: (-scored.get(team, 0.0), team))
             allocation[entry.entry_id] = teams[0]; backups[entry.entry_id] = teams[1] if len(teams) > 1 else None
-        fixture_probabilities = {}; fixture_teams = {}
-        for fixture in eligible_fixtures(self.fixtures(), round_number):
-            quotes = [q for q in self.odds() if q.fixture_id == fixture.fixture_id]
-            consensus = [sum(getattr(q, side) for q in quotes) / len(quotes) for side in ("home", "draw", "away")]
-            fixture_probabilities[fixture.fixture_id] = proportional(consensus); fixture_teams[fixture.fixture_id] = (fixture.home_team, fixture.away_team)
+        fixture_probabilities, fixture_teams = self.simulation_inputs(round_number)
         risk = exact_current_round(allocation, fixture_probabilities, fixture_teams)
         return {"allocation": allocation, "backups": backups, "probabilities": [row.__dict__ for row in probabilities], "exposure": self.exposure(round_number), "risk": risk, "strategy": strategy, "objective_weights": {"expected_survivors": 0.0, "at_least_one": 0.0, "wipeout": 0.0, "future_value": 0.0, "concentration": 0.0, "cvar": 0.0}}
 

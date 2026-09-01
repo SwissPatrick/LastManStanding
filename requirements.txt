@@ -9,4 +9,4 @@ scikit-learn>=1.5
 SQLAlchemy>=2.0
 pytest>=8.0
 python-dotenv>=1.0
-
+threadpoolctl>=3.5

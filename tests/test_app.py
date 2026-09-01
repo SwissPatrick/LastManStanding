@@ -31,3 +31,14 @@ def test_dashboard_loads_deterministic_dry_run_fixture(tmp_path, monkeypatch):
     widget_by_label(app.button, "Load deterministic historical dry-run").click().run()
     assert not app.exception
     assert any("Historical dry-run data loaded" in alert.value for alert in app.success)
+
+
+def test_dashboard_exposes_cpu_profile_after_analysis(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    app = AppTest.from_file(APP).run()
+    widget_by_label(app.button, "Load deterministic historical dry-run").click().run()
+    widget_by_label(app.button, "Continue to validation").click().run()
+    widget_by_label(app.button, "Continue to analysis").click().run()
+    widget_by_label(app.button, "Run exact analysis").click().run()
+    assert widget_by_label(app.selectbox, "Performance profile")
+    assert widget_by_label(app.number_input, "Process workers")
