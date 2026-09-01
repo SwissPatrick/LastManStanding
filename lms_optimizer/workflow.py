@@ -1,7 +1,7 @@
 """Business workflow for manual cartel operation."""
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from .models import Entry, Fixture, FixtureStatus, OddsQuote, Player, Round, Season
 from .probability import additive, market_disagreement, proportional, power_method, shin
 from .rules import eligible_fixtures, round_is_open, validate_selection
@@ -10,6 +10,54 @@ from .simulation import exact_current_round, adaptive_multi_round_simulation
 from .forecast_snapshot import ForecastSnapshot, ForecastStore
 from .providers import Provider, ProviderEvent, ProviderError, normalise_team
 import numpy as np
+
+
+def select_current_provider_events(events: tuple[ProviderEvent, ...], now: datetime | None = None) -> dict[str, object]:
+    """Select one deterministic upcoming EPL matchweek from provider events.
+
+    The Odds API can return multiple upcoming weeks.  A gap greater than four
+    days separates clusters; events are sorted by kickoff and event ID so the
+    result is independent of provider response order.  Started events and
+    duplicate-team events are retained in diagnostics but never imported into
+    the selected LMS round.
+    """
+    now = now or datetime.now(timezone.utc)
+    ordered = sorted(events, key=lambda event: (event.kickoff, event.event_id))
+    started = [event for event in ordered if event.kickoff <= now]
+    upcoming = [event for event in ordered if event.kickoff > now]
+    clusters: list[list[ProviderEvent]] = []
+    for event in upcoming:
+        if not clusters or event.kickoff - clusters[-1][-1].kickoff > timedelta(days=4):
+            clusters.append([])
+        clusters[-1].append(event)
+
+    warnings: list[str] = []
+    if len(clusters) > 1:
+        boundary_gap = clusters[1][0].kickoff - clusters[0][-1].kickoff
+        if timedelta(days=4) < boundary_gap <= timedelta(days=4, hours=12):
+            warnings.append("ambiguous_matchweek_boundary")
+    selected: list[ProviderEvent] = []
+    used_teams: set[str] = set()
+    if clusters:
+        for event in clusters[0]:
+            teams = {event.home_team, event.away_team}
+            if used_teams.intersection(teams):
+                warnings.append(f"team_conflict:{event.event_id}")
+                continue
+            if len(selected) >= 10:
+                warnings.append("ten_fixture_cap")
+                break
+            selected.append(event)
+            used_teams.update(teams)
+    if clusters and len(clusters[0]) > len(selected) and "ten_fixture_cap" not in warnings:
+        warnings.append("team_conflicts_in_current_cluster")
+    return {
+        "selected": tuple(selected),
+        "started": tuple(started),
+        "clusters": tuple(tuple(event.event_id for event in cluster) for cluster in clusters),
+        "deferred": tuple(event.event_id for cluster in clusters[1:] for event in cluster),
+        "warnings": tuple(warnings),
+    }
 
 @dataclass(frozen=True)
 class TeamProbability:
@@ -53,8 +101,9 @@ class LMSWorkflow:
     def refresh_provider_odds(self, provider: Provider, season: str, round_number: int, tolerance_hours: int = 3, force_refresh: bool = False) -> dict[str, object]:
         response = provider.current_odds(force_refresh=force_refresh)
         existing = self.fixtures(); created, matched, ambiguous, quotes = [], [], [], []
-        now = datetime.now(timezone.utc)
-        for event in response.events:
+        selection = select_current_provider_events(response.events)
+        current_round_events = selection["selected"]
+        for event in current_round_events:
             candidates = [fixture for fixture in existing if fixture.provider_event_id == event.event_id]
             if not candidates:
                 candidates = [fixture for fixture in existing if fixture.season == season and fixture.round_number == round_number and normalise_team(fixture.home_team) == event.home_team and normalise_team(fixture.away_team) == event.away_team and abs((fixture.kickoff - event.kickoff).total_seconds()) <= tolerance_hours * 3600]
@@ -72,10 +121,10 @@ class LMSWorkflow:
                     quotes.append(OddsQuote(fixture_id=fixture.fixture_id, bookmaker=bookmaker.key, home=outcome_map[event.home_team], draw=outcome_map["Draw"], away=outcome_map[event.away_team], collected_at=response.retrieved_at, market_timestamp=bookmaker.last_update or response.retrieved_at, data_source=response.provider))
         if created: self.add_fixtures(created)
         if quotes: self.add_odds(quotes)
-        provenance = {"provider": response.provider, "endpoint_type": response.endpoint_type, "retrieval_timestamp": response.retrieved_at.isoformat(), "http_status": response.http_status, "response_checksum": response.checksum, "request_parameters": response.request_parameters, "quota_headers": response.quota_headers, "provider_event_ids": [event.event_id for event in response.events], "raw_response_storage_reference": response.raw_storage_reference}
+        provenance = {"provider": response.provider, "endpoint_type": response.endpoint_type, "retrieval_timestamp": response.retrieved_at.isoformat(), "http_status": response.http_status, "response_checksum": response.checksum, "request_parameters": response.request_parameters, "quota_headers": response.quota_headers, "provider_event_ids": [event.event_id for event in current_round_events], "provider_event_count": len(response.events), "started_event_ids": [event.event_id for event in selection["started"]], "deferred_event_ids": list(selection["deferred"]), "grouping_warnings": list(selection["warnings"]), "round_clusters": [list(cluster) for cluster in selection["clusters"]], "raw_response_storage_reference": response.raw_storage_reference}
         self.repo.record_raw("provider_response_metadata", response.retrieved_at.isoformat(), provenance)
         self.repo.audit("provider_odds_refresh", provenance)
-        return {"events": len(response.events), "created": len(created), "matched": len(matched), "ambiguous": ambiguous, "bookmakers": len(quotes), "provenance": provenance, "from_cache": response.from_cache, "stale": response.stale}
+        return {"events": len(current_round_events), "provider_events": len(response.events), "created": len(created), "matched": len(matched), "ambiguous": ambiguous, "bookmakers": len(quotes), "deferred_events": list(selection["deferred"]), "started_events": [event.event_id for event in selection["started"]], "warnings": list(selection["warnings"]), "provenance": provenance, "from_cache": response.from_cache, "stale": response.stale}
 
     def propose_provider_results(self, provider: Provider, force_refresh: bool = False) -> dict[str, object]:
         response = provider.recent_scores(force_refresh=force_refresh); fixtures = {fixture.provider_event_id: fixture for fixture in self.fixtures() if fixture.provider_event_id}; proposals, unmatched = [], []

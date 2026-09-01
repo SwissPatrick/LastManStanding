@@ -12,6 +12,7 @@ from typing import Callable, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+from dotenv import load_dotenv
 
 
 TEAM_ALIASES = {"manchester united": "Manchester United", "man utd": "Manchester United", "manchester city": "Manchester City", "man city": "Manchester City", "tottenham hotspur": "Tottenham", "spurs": "Tottenham", "west ham united": "West Ham", "newcastle united": "Newcastle", "brighton and hove albion": "Brighton", "nottingham forest": "Nottingham Forest", "wolves": "Wolverhampton Wanderers"}
@@ -78,6 +79,7 @@ class OddsApiProvider:
     provider_name = "The Odds API v4"
 
     def __init__(self, api_key: str | None = None, cache_dir: str | Path = "data/provider_cache", cache_seconds: int = 300, timeout: float = 10.0, opener: Callable = urlopen, sleep: Callable = time.sleep):
+        if api_key is None: load_dotenv()
         self.api_key = api_key if api_key is not None else os.getenv("ODDS_API_KEY", "").strip()
         self.cache_dir = Path(cache_dir); self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.cache_seconds = max(300, int(cache_seconds)); self.timeout = timeout; self.opener = opener; self.sleep = sleep
@@ -138,4 +140,18 @@ class OddsApiProvider:
 
 def live_smoke_test() -> dict[str, object]:
     response = OddsApiProvider().current_odds(force_refresh=True)
-    return {"provider": response.provider, "events": len(response.events), "bookmakers": sum(len(event.bookmakers) for event in response.events), "quota_headers": response.quota_headers, "checksum": response.checksum}
+    included = [book for event in response.events for book in event.bookmakers if book.included]
+    update_timestamps = sorted({book.last_update.isoformat() for book in included if book.last_update})
+    mapped = all(event.home_team == normalise_team(event.home_team) and event.away_team == normalise_team(event.away_team) for event in response.events)
+    return {
+        "provider": response.provider,
+        "authentication": response.http_status == 200,
+        "request_parameters": response.request_parameters,
+        "events": len(response.events),
+        "bookmakers": len({book.key for book in included}),
+        "complete_three_way_markets": len(included),
+        "provider_update_timestamps": update_timestamps,
+        "team_mapping_succeeds": mapped,
+        "quota_headers": {key: value for key, value in response.quota_headers.items() if key.lower() in {"x-requests-used", "x-requests-remaining", "x-requests-last"}},
+        "checksum": response.checksum,
+    }

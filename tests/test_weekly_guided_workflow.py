@@ -5,7 +5,7 @@ import pytest
 
 from lms_optimizer.models import Entry, Fixture, FixtureStatus, OddsQuote, Player, Round, Season
 from lms_optimizer.storage import Repository
-from lms_optimizer.workflow import LMSWorkflow
+from lms_optimizer.workflow import LMSWorkflow, select_current_provider_events
 from lms_optimizer.forecast_snapshot import ForecastStore
 from lms_optimizer.weekly import RecommendationSnapshot, WeeklyStore
 from lms_optimizer.providers import ProviderBookmaker, ProviderEvent, ProviderOutcome, ProviderResponse
@@ -86,3 +86,62 @@ def test_provider_refresh_matches_event_id_and_preserves_provenance(tmp_path):
     assert result["events"] == 1 and result["bookmakers"] == 1
     assert service.fixtures()[-1].provider_event_id == "provider-1"
     assert "abc" in json.dumps(service.repo.list_payloads("raw_imports"))
+
+
+def test_provider_refresh_selects_current_matchweek_independent_of_response_order(tmp_path):
+    service = setup_service(tmp_path)
+    now = datetime.now(timezone.utc)
+    events = []
+    for week, offset in (("current", 3), ("later", 11)):
+        for index in range(10):
+            kickoff = now + timedelta(days=offset, minutes=index)
+            home = f"{week.title()} Home {index}"
+            away = f"{week.title()} Away {index}"
+            events.append(ProviderEvent(
+                f"{week}-{index}", home, away, kickoff,
+                (ProviderBookmaker("uk-book", "UK Book", now, (
+                    ProviderOutcome(home, 1.5),
+                    ProviderOutcome("Draw", 4.0),
+                    ProviderOutcome(away, 6.0),
+                )),),
+            ))
+    response = ProviderResponse("The Odds API v4", "current_odds", now, 200, "twenty", {"regions": "uk", "markets": "h2h"}, {}, str(tmp_path / "raw.json"), tuple(reversed(events)))
+
+    class FakeProvider:
+        def current_odds(self, force_refresh=False): return response
+
+    result = service.refresh_provider_odds(FakeProvider(), "2026/27", 1)
+    selected = {fixture.provider_event_id for fixture in service.fixtures() if fixture.provider_event_id}
+    assert result["events"] == 10
+    assert result["provider_events"] == 20
+    assert selected == {f"current-{index}" for index in range(10)}
+    assert set(result["deferred_events"]) == {f"later-{index}" for index in range(10)}
+    assert result["warnings"] == []
+    assert result["provenance"]["round_clusters"] == [[f"current-{index}" for index in range(10)], [f"later-{index}" for index in range(10)]]
+
+
+def test_provider_event_selection_flags_started_team_conflicts_and_caps():
+    now = datetime(2030, 1, 1, tzinfo=timezone.utc)
+    def event(event_id, kickoff, home, away):
+        return ProviderEvent(event_id, home, away, kickoff, ())
+    result = select_current_provider_events((
+        event("started", now - timedelta(hours=1), "Old Home", "Old Away"),
+        event("first", now + timedelta(days=1), "A", "B"),
+        event("conflict", now + timedelta(days=1, minutes=1), "B", "C"),
+        event("second", now + timedelta(days=1, minutes=2), "D", "E"),
+    ), now=now)
+    assert [item.event_id for item in result["started"]] == ["started"]
+    assert [item.event_id for item in result["selected"]] == ["first", "second"]
+    assert "team_conflict:conflict" in result["warnings"]
+
+
+def test_provider_event_selection_enforces_cap_and_reports_ambiguous_boundary():
+    now = datetime(2030, 1, 1, tzinfo=timezone.utc)
+    def event(event_id, kickoff, home, away):
+        return ProviderEvent(event_id, home, away, kickoff, ())
+    first = [event(f"f{i}", now + timedelta(days=1, minutes=i), f"FH{i}", f"FA{i}") for i in range(10)]
+    near_boundary = event("near", now + timedelta(days=5, hours=1), "NH", "NA")
+    result = select_current_provider_events(tuple(first + [near_boundary]), now=now)
+    assert len(result["selected"]) == 10
+    assert result["deferred"] == ("near",)
+    assert "ambiguous_matchweek_boundary" in result["warnings"]
