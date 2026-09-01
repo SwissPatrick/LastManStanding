@@ -7,6 +7,7 @@ from .probability import additive, market_disagreement, proportional, power_meth
 from .rules import eligible_fixtures, round_is_open, validate_selection
 from .storage import Repository
 from .simulation import exact_current_round, adaptive_multi_round_simulation
+from .forecast_snapshot import ForecastSnapshot, ForecastStore
 
 @dataclass(frozen=True)
 class TeamProbability:
@@ -23,6 +24,9 @@ class TeamProbability:
 class LMSWorkflow:
     def __init__(self, repository: Repository) -> None:
         self.repo = repository
+
+    def forecast_snapshots(self, directory: str | None = None) -> list[ForecastSnapshot]:
+        return [ForecastSnapshot.model_validate_json(path.read_text()) for path in sorted(ForecastStore(directory or "data/forecasts").directory.glob("*.json"))]
 
     def create_season(self, season: Season) -> None:
         self.repo.save_season(season)
@@ -131,7 +135,7 @@ class LMSWorkflow:
                 if winner != item["team"]: results[item["entry_id"]] = "eliminated"
         return results
 
-    def validate_round(self, season: str, round_number: int, strategy: str = "concentrated_favourite") -> dict[str, object]:
+    def validate_round(self, season: str, round_number: int, strategy: str = "concentrated_favourite", forecast_version: str | None = None) -> dict[str, object]:
         rounds = [Round.model_validate(x) for x in self.repo.list_payloads("rounds") if x["season"] == season and x["round_number"] == round_number]
         fixtures = [f for f in self.fixtures() if f.season == season and f.round_number == round_number]
         eligible = eligible_fixtures(fixtures, round_number)
@@ -146,9 +150,12 @@ class LMSWorkflow:
         entries = [e for e in self.entries() if e.season == season and e.active]
         if not entries: errors.append("Create at least one active entry.")
         if any(not self.available_teams(e.entry_id, round_number) for e in entries): errors.append("Each active entry needs an eligible unused team.")
-        if strategy in {"bellman", "balanced"} and not self.repo.list_payloads("raw_imports"):
-            errors.append("Future-value strategies require a saved forecast snapshot.")
-        return {"valid": not errors, "errors": errors, "eligible_fixture_count": len(eligible), "six_match_rule": len(eligible) >= 6, "active_entry_count": len(entries), "odds_complete": all(bool(rows) for rows in by_fixture.values()), "timezone": str(rounds[-1].selection_deadline.tzinfo) if rounds else ""}
+        forecast = next((item for item in self.forecast_snapshots() if item.version == forecast_version), None) if forecast_version else None
+        if strategy in {"bellman", "balanced"}:
+            if forecast is None: errors.append("Future-value strategies require a selected forecast snapshot.")
+            elif forecast.validation_status != "validated": errors.append("Selected forecast snapshot is not validated.")
+            elif forecast.information_cutoff < max((quote.market_timestamp for quote in quotes), default=forecast.information_cutoff): errors.append("Selected forecast snapshot is stale because odds were observed after its cutoff.")
+        return {"valid": not errors, "errors": errors, "eligible_fixture_count": len(eligible), "six_match_rule": len(eligible) >= 6, "active_entry_count": len(entries), "odds_complete": all(bool(rows) for rows in by_fixture.values()), "timezone": str(rounds[-1].selection_deadline.tzinfo) if rounds else "", "forecast_version": forecast.version if forecast else None, "forecast_state": forecast.validation_status if forecast else "absent", "forecast_cutoff": forecast.information_cutoff.isoformat() if forecast else None}
 
     def analyse_round(self, season: str, round_number: int, strategy: str = "concentrated_favourite") -> dict[str, object]:
         gate = self.validate_round(season, round_number, strategy)

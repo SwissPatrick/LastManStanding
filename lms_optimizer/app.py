@@ -16,6 +16,7 @@ def run() -> None:
     from .rules import eligible_fixtures
     from .storage import Repository
     from .weekly import RecommendationSnapshot, WeeklyStore
+    from .forecast_snapshot import ForecastStore
     from .workflow import LMSWorkflow
     st.set_page_config(page_title="LMS Weekly Manager", layout="wide")
     st.title("Premier League Last Man Standing")
@@ -26,7 +27,7 @@ def run() -> None:
     season = st.session_state.get("season", "2026/27"); round_number = int(st.session_state.get("round_number", 1))
     st.progress((st.session_state.step + 1) / len(steps), text=f"Step {st.session_state.step + 1} of {len(steps)} · {steps[st.session_state.step]}")
     st.write("Completed:", " · ".join(steps[:st.session_state.step]) or "none")
-    try: gate = service.validate_round(season, round_number, st.session_state.get("strategy", "concentrated_favourite"))
+    try: gate = service.validate_round(season, round_number, st.session_state.get("strategy", "concentrated_favourite"), st.session_state.get("forecast_version"))
     except Exception as exc: gate = {"valid": False, "errors": [str(exc)]}
     with st.expander("Blocking problems", expanded=True):
         if gate.get("valid"): st.success("Current prerequisites are satisfied.")
@@ -60,12 +61,20 @@ def run() -> None:
         st.header("2. Fixtures and odds"); st.caption("Manual and timestamp-unknown odds are never labelled live.")
         with st.form("fixture_form"):
             fixture_id = st.text_input("Fixture identifier", str(uuid.uuid4())[:8]); home = st.text_input("Home team"); away = st.text_input("Away team"); kickoff_date = st.date_input("Date and kickoff date"); kickoff_time = st.time_input("Kickoff time"); status = st.selectbox("Fixture status", list(FixtureStatus), format_func=lambda x: x.value)
-            if st.form_submit_button("Add fixture"):
+            if st.form_submit_button("Add fixture", disabled=st.session_state.locked):
                 try: service.add_fixtures([Fixture(fixture_id=fixture_id, season=season, round_number=round_number, home_team=home, away_team=away, kickoff=datetime.combine(kickoff_date, kickoff_time, tzinfo=timezone.utc), status=status, data_source="manual", collected_at=datetime.now(timezone.utc))]); st.success("Fixture saved.")
                 except Exception as exc: st.error(str(exc))
+        current_fixtures = [f for f in service.fixtures() if f.season == season and f.round_number == round_number]
+        if current_fixtures:
+            st.subheader("Bookmaker odds")
+            with st.form("odds_form"):
+                odds_fixture = st.selectbox("Fixture for odds", [f.fixture_id for f in current_fixtures]); bookmaker = st.text_input("Bookmaker"); home_odds = st.number_input("Home decimal odds", min_value=1.01, value=2.0); draw_odds = st.number_input("Draw decimal odds", min_value=1.01, value=3.4); away_odds = st.number_input("Away decimal odds", min_value=1.01, value=3.6); odds_date = st.date_input("Odds observation date"); odds_time = st.time_input("Odds observation time")
+                if st.form_submit_button("Add bookmaker odds", disabled=st.session_state.locked):
+                    try: service.add_odds([OddsQuote(fixture_id=odds_fixture, bookmaker=bookmaker, home=home_odds, draw=draw_odds, away=away_odds, collected_at=datetime.now(timezone.utc), market_timestamp=datetime.combine(odds_date, odds_time, tzinfo=timezone.utc), data_source="manual")]); st.success("Odds quote saved; a new recommendation version is required after re-analysis.")
+                    except Exception as exc: st.error(str(exc))
         st.subheader("CSV paste/import"); st.caption("Columns: fixture_id,home_team,away_team,kickoff,bookmaker,home_odds,draw_odds,away_odds,market_timestamp")
         pasted = st.text_area("Fixture and odds CSV")
-        if st.button("Import CSV paste") and pasted:
+        if st.button("Import CSV paste", disabled=st.session_state.locked) and pasted:
             try:
                 fixtures, quotes = [], []
                 for row in csv.DictReader(io.StringIO(pasted)):
@@ -96,7 +105,24 @@ def run() -> None:
         if st.button("Continue to validation", key="next2"): go(3)
     labels = {"concentrated_favourite": "Concentrated market favourite — Validated default", "independent_greedy": "Independent greedy — validated alternative", "max_expected_survivors": "Maximum expected survivors — validated alternative", "protect_one": "Protect One — experimental", "bellman": "Bellman — experimental", "equal_diversification": "Equal diversification — experimental", "balanced": "Balanced — experimental"}
     with tabs[3]:
-        st.header("4. Validate round"); strategy = st.selectbox("Strategy", list(labels), format_func=lambda x: labels[x], key="strategy"); gate = service.validate_round(season, round_number, strategy); st.json(gate)
+        st.header("4. Validate round"); strategy = st.selectbox("Strategy", list(labels), format_func=lambda x: labels[x], key="strategy")
+        forecasts = service.forecast_snapshots(); forecast_options = ["(none)"] + [f"{item.version} · {item.model_name}" for item in forecasts]
+        chosen_forecast = st.selectbox("Future forecast snapshot", forecast_options, disabled=strategy not in {"bellman", "balanced"})
+        if chosen_forecast != "(none)": st.session_state.forecast_version = chosen_forecast.split(" · ", 1)[0]
+        elif strategy not in {"bellman", "balanced"}: st.session_state.pop("forecast_version", None)
+        with st.expander("Create immutable forecast snapshot"):
+            forecast_cutoff = st.datetime_input("Forecast information cutoff", value=datetime.now(timezone.utc))
+            forecast_training = st.datetime_input("Forecast training cutoff", value=datetime.now(timezone.utc))
+            forecast_model = st.text_input("Forecast model", "manual-forecast")
+            forecast_model_version = st.text_input("Forecast model version", "1")
+            forecast_manifest = st.text_area("Forecast manifest / provenance", "Manual local forecast input")
+            if st.button("Create forecast snapshot"):
+                try:
+                    snap = ForecastStore().create_manual(forecast_cutoff, forecast_training, forecast_manifest, forecast_model, forecast_model_version, [], validation_status="validated", provenance="guided manual weekly input"); ForecastStore().save(snap); st.session_state.forecast_version = snap.version; st.success(f"Forecast snapshot {snap.version} saved.")
+                except Exception as exc: st.error(str(exc))
+        for item in forecasts:
+            st.caption(f"Forecast {item.version} · cutoff {item.information_cutoff.isoformat()} · model {item.model_name} {item.model_version} · {item.provenance} · {item.validation_status}")
+        gate = service.validate_round(season, round_number, strategy, st.session_state.get("forecast_version")); st.json(gate)
         if gate["valid"]: st.success("Validation passed; analysis is unlocked."); st.session_state.validation = True
         else: st.error("Resolve the blocking problems before analysis.")
         if st.button("Continue to analysis", key="next3", disabled=not gate["valid"]): go(4)
@@ -117,15 +143,29 @@ def run() -> None:
     with tabs[6]:
         st.header("7. Lock and share"); analysis = st.session_state.analysis
         if analysis:
+            versions = WeeklyStore().versions()
+            if versions:
+                st.subheader("Saved recommendation versions")
+                st.dataframe(pd.DataFrame([{"Version": item.version, "Locked": item.locked, "Created": item.created_at.isoformat(), "Forecast": item.forecast_snapshot_version, "Previous": item.previous_version, "Unlock reason": item.unlock_reason} for item in versions]), use_container_width=True)
+                if len(versions) >= 2:
+                    left = st.selectbox("Compare version A", [item.version for item in versions], key="compare_left")
+                    right = st.selectbox("Compare version B", [item.version for item in versions], index=min(1, len(versions)-1), key="compare_right")
+                    if left != right: st.json(WeeklyStore.compare(next(item for item in versions if item.version == left), next(item for item in versions if item.version == right)))
             if st.button("Save recommendation snapshot", disabled=st.session_state.locked):
                 try:
-                    version = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ"); snap = RecommendationSnapshot(version=version, created_at=datetime.now(timezone.utc), season=season, round_number=round_number, odds_snapshot_version="manual-odds", forecast_snapshot_version="not-selected", active_entries=list(analysis["allocation"]), used_teams={e: service.used_teams(e) for e in analysis["allocation"]}, objective_weights=analysis["objective_weights"], exposure_limits={}, simulation_settings={}, seed=7, optimiser_version="weekly-service", allocation=analysis["allocation"], risk_estimates={"expected_survivors": float(analysis["risk"]["expected_survivors"])}); WeeklyStore().save(snap); st.session_state.snapshot = snap; st.success("Immutable recommendation snapshot saved.")
+                    version = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ"); snap = RecommendationSnapshot(version=version, created_at=datetime.now(timezone.utc), season=season, round_number=round_number, odds_snapshot_version=f"manual-odds-{len(service.odds())}", forecast_snapshot_version=st.session_state.get("forecast_version", "not-required"), active_entries=list(analysis["allocation"]), used_teams={e: service.used_teams(e) for e in analysis["allocation"]}, objective_weights=analysis["objective_weights"], exposure_limits={}, simulation_settings={}, seed=7, optimiser_version="weekly-service", allocation=analysis["allocation"], backups=analysis["backups"], odds_snapshot={q.fixture_id: q.model_dump() for q in service.odds()}, probabilities={row["team"]: row["proportional"] for row in analysis["probabilities"]}, exact_risk=analysis["risk"], risk_estimates={"expected_survivors": float(analysis["risk"]["expected_survivors"])}); WeeklyStore().save(snap); st.session_state.snapshot = snap; st.success("Immutable recommendation snapshot saved.")
                 except Exception as exc: st.error(str(exc))
             if st.button("Lock picks", disabled=st.session_state.locked or "snapshot" not in st.session_state):
                 try:
-                    service.save_recommendation_selections(analysis["allocation"], analysis["backups"], round_number); st.session_state.locked = True; repo.audit("recommendation_locked", {"season": season, "round": round_number}); st.success("Picks locked.")
+                    locked_path = WeeklyStore().lock(st.session_state.snapshot.version); st.session_state.snapshot = RecommendationSnapshot.model_validate_json(locked_path.read_text()); service.save_recommendation_selections(analysis["allocation"], analysis["backups"], round_number); st.session_state.locked = True; repo.audit("recommendation_locked", {"version": st.session_state.snapshot.version, "season": season, "round": round_number}); st.success("Picks locked. This version cannot be modified.")
                 except Exception as exc: st.error(str(exc))
             if st.session_state.locked: st.code(WeeklyStore.whatsapp_message(st.session_state.snapshot), language=None)
+            if st.session_state.locked:
+                unlock_reason = st.text_input("Unlock reason (required)")
+                if st.button("Explicitly unlock and create new version"):
+                    try:
+                        new_snapshot = WeeklyStore().unlock(st.session_state.snapshot.version, unlock_reason); repo.audit("recommendation_unlocked", {"user_action_time": datetime.now(timezone.utc).isoformat(), "previous_version": st.session_state.snapshot.version, "new_version": new_snapshot.version, "reason": unlock_reason}); st.session_state.snapshot = new_snapshot; st.session_state.locked = False; st.success(f"Unlocked into new version {new_snapshot.version}; the old locked version remains preserved.")
+                    except Exception as exc: st.error(str(exc))
         if st.button("Continue to results", key="next6", disabled=not st.session_state.locked): go(7)
     with tabs[7]:
         st.header("8. Record results"); fixtures = [f for f in service.fixtures() if f.season == season and f.round_number == round_number]

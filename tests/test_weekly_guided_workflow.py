@@ -5,6 +5,8 @@ import pytest
 from lms_optimizer.models import Entry, Fixture, FixtureStatus, OddsQuote, Player, Round, Season
 from lms_optimizer.storage import Repository
 from lms_optimizer.workflow import LMSWorkflow
+from lms_optimizer.forecast_snapshot import ForecastStore
+from lms_optimizer.weekly import RecommendationSnapshot, WeeklyStore
 
 
 def setup_service(tmp_path):
@@ -44,3 +46,29 @@ def test_guided_lock_result_and_survivor_advancement(tmp_path):
     assert service.repo.count("selections") >= 1
     result = service.record_results_and_advance("f0", FixtureStatus.PLAYED, 2, 0)
     assert result["e1"] == "surviving"
+
+
+def test_forecast_required_creation_and_stale_gate(tmp_path):
+    service = setup_service(tmp_path)
+    assert not service.validate_round("2026/27", 1, "bellman")["valid"]
+    store = ForecastStore(tmp_path / "forecasts")
+    old = store.create_manual(datetime(2020, 1, 1, tzinfo=timezone.utc), datetime(2019, 1, 1, tzinfo=timezone.utc), "old", "elo", "1", [])
+    store.save(old)
+    assert not service.validate_round("2026/27", 1, "bellman", old.version)["valid"]
+    fresh = store.create_manual(datetime.now(timezone.utc) + timedelta(days=1), datetime.now(timezone.utc), "fresh", "elo", "1", [])
+    store.save(fresh)
+    service.forecast_snapshots = lambda: [old, fresh]
+    assert service.validate_round("2026/27", 1, "bellman", fresh.version)["valid"]
+
+
+def test_recommendation_compare_lock_unlock_preserves_versions_and_audit(tmp_path):
+    store = WeeklyStore(tmp_path / "recommendations")
+    base = RecommendationSnapshot(version="v1", created_at=datetime.now(timezone.utc), season="2026/27", round_number=1, odds_snapshot_version="o1", forecast_snapshot_version="f1", active_entries=["e1"], used_teams={"e1": []}, objective_weights={"expected": 1}, exposure_limits={}, simulation_settings={}, seed=7, optimiser_version="test", allocation={"e1": "A"}, backups={"e1": "B"}, odds_snapshot={"f1": {"home": 2.0}}, probabilities={"A": .5}, exact_risk={"cvar": 1.0}, risk_estimates={"cvar": 1.0})
+    store.save(base); locked_path = store.lock("v1"); locked = RecommendationSnapshot.model_validate_json(locked_path.read_text())
+    with pytest.raises(ValueError): store.unlock(locked.version, "")
+    changed = base.model_copy(update={"version": "v2", "allocation": {"e1": "C"}, "odds_snapshot": {"f1": {"home": 3.0}}}); store.save(changed)
+    comparison = store.compare(base, changed)
+    assert comparison["allocations"] and comparison["odds"]
+    unlocked = store.unlock(locked.version, "odds changed", datetime.now(timezone.utc))
+    assert not unlocked.locked and unlocked.previous_version == locked.version
+    assert locked_path.exists() and (store.directory / f"{unlocked.version}.json").exists()
