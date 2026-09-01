@@ -8,6 +8,8 @@ from .rules import eligible_fixtures, round_is_open, validate_selection
 from .storage import Repository
 from .simulation import exact_current_round, adaptive_multi_round_simulation
 from .forecast_snapshot import ForecastSnapshot, ForecastStore
+from .providers import Provider, ProviderEvent, ProviderError, normalise_team
+import numpy as np
 
 @dataclass(frozen=True)
 class TeamProbability:
@@ -47,6 +49,48 @@ class LMSWorkflow:
         self.repo.save_odds(quotes)
         for quote in quotes:
             self.repo.audit("odds_saved", quote.model_dump())
+
+    def refresh_provider_odds(self, provider: Provider, season: str, round_number: int, tolerance_hours: int = 3, force_refresh: bool = False) -> dict[str, object]:
+        response = provider.current_odds(force_refresh=force_refresh)
+        existing = self.fixtures(); created, matched, ambiguous, quotes = [], [], [], []
+        now = datetime.now(timezone.utc)
+        for event in response.events:
+            candidates = [fixture for fixture in existing if fixture.provider_event_id == event.event_id]
+            if not candidates:
+                candidates = [fixture for fixture in existing if fixture.season == season and fixture.round_number == round_number and normalise_team(fixture.home_team) == event.home_team and normalise_team(fixture.away_team) == event.away_team and abs((fixture.kickoff - event.kickoff).total_seconds()) <= tolerance_hours * 3600]
+            if len(candidates) > 1: ambiguous.append({"event_id": event.event_id, "reason": "multiple fixture matches"}); continue
+            fixture = candidates[0] if candidates else None
+            if fixture is None:
+                fixture = Fixture(fixture_id=f"odds-{event.event_id}", provider_event_id=event.event_id, season=season, round_number=round_number, home_team=event.home_team, away_team=event.away_team, kickoff=event.kickoff, collected_at=response.retrieved_at, market_timestamp=response.retrieved_at, data_source=response.provider)
+                created.append(fixture); existing.append(fixture)
+            elif fixture.provider_event_id != event.event_id:
+                fixture = fixture.model_copy(update={"provider_event_id": event.event_id, "collected_at": response.retrieved_at})
+                self.repo.save_fixtures([fixture]); matched.append(fixture.fixture_id)
+            for bookmaker in event.bookmakers:
+                if bookmaker.included:
+                    outcome_map = {normalise_team(outcome.name): outcome.price for outcome in bookmaker.outcomes}
+                    quotes.append(OddsQuote(fixture_id=fixture.fixture_id, bookmaker=bookmaker.key, home=outcome_map[event.home_team], draw=outcome_map["Draw"], away=outcome_map[event.away_team], collected_at=response.retrieved_at, market_timestamp=bookmaker.last_update or response.retrieved_at, data_source=response.provider))
+        if created: self.add_fixtures(created)
+        if quotes: self.add_odds(quotes)
+        provenance = {"provider": response.provider, "endpoint_type": response.endpoint_type, "retrieval_timestamp": response.retrieved_at.isoformat(), "http_status": response.http_status, "response_checksum": response.checksum, "request_parameters": response.request_parameters, "quota_headers": response.quota_headers, "provider_event_ids": [event.event_id for event in response.events], "raw_response_storage_reference": response.raw_storage_reference}
+        self.repo.record_raw("provider_response_metadata", response.retrieved_at.isoformat(), provenance)
+        self.repo.audit("provider_odds_refresh", provenance)
+        return {"events": len(response.events), "created": len(created), "matched": len(matched), "ambiguous": ambiguous, "bookmakers": len(quotes), "provenance": provenance, "from_cache": response.from_cache, "stale": response.stale}
+
+    def propose_provider_results(self, provider: Provider, force_refresh: bool = False) -> dict[str, object]:
+        response = provider.recent_scores(force_refresh=force_refresh); fixtures = {fixture.provider_event_id: fixture for fixture in self.fixtures() if fixture.provider_event_id}; proposals, unmatched = [], []
+        for event in response.events:
+            fixture = fixtures.get(event.event_id)
+            if fixture is None: unmatched.append({"event_id": event.event_id, "home_team": event.home_team, "away_team": event.away_team}); continue
+            if event.home_score is not None and event.away_score is not None: proposals.append({"fixture_id": fixture.fixture_id, "provider_event_id": event.event_id, "status": FixtureStatus.PLAYED.value, "home_goals": event.home_score, "away_goals": event.away_score, "provenance": {"provider": response.provider, "checksum": response.checksum, "retrieved_at": response.retrieved_at.isoformat()}})
+        return {"proposals": proposals, "unmatched": unmatched, "provenance": {"provider": response.provider, "endpoint_type": response.endpoint_type, "checksum": response.checksum, "retrieved_at": response.retrieved_at.isoformat()}}
+
+    def confirm_provider_results(self, proposals: list[dict[str, object]]) -> dict[str, str]:
+        survival = {}
+        for proposal in proposals:
+            survival = self.record_results_and_advance(proposal["fixture_id"], FixtureStatus.PLAYED, int(proposal["home_goals"]), int(proposal["away_goals"]))
+        self.repo.audit("provider_results_confirmed", {"proposals": proposals, "survival": survival})
+        return survival
 
     def add_player(self, player: Player) -> None:
         self.repo.save_player(player)
@@ -101,12 +145,12 @@ class LMSWorkflow:
             market = [q for q in quotes if q.fixture_id == fixture.fixture_id]
             if not market: continue
             arrays = [[q.home, q.draw, q.away] for q in market]
-            consensus = [sum(row[i] for row in arrays) / len(arrays) for i in range(3)]
-            raw = [1 / x for x in consensus]
-            probs = [proportional(consensus), additive(consensus), power_method(consensus), shin(consensus)]
+            per_bookmaker = [[proportional(odds), additive(odds), power_method(odds), shin(odds)] for odds in arrays]
+            probs = [np.mean([bookmaker[index] for bookmaker in per_bookmaker], axis=0) for index in range(4)]
+            overround = float(np.mean([sum(1 / price for price in odds) - 1 for odds in arrays]))
             disagreement = market_disagreement([[1 / q.home, 1 / q.draw, 1 / q.away] for q in market])
             for team, index in ((fixture.home_team, 0), (fixture.away_team, 2)):
-                output.append(TeamProbability(team, fixture.fixture_id, len(market), sum(raw) - 1, *(float(p[index]) for p in probs), disagreement))
+                output.append(TeamProbability(team, fixture.fixture_id, len(market), overround, *(float(p[index]) for p in probs), disagreement))
         return output
 
     def exposure(self, round_number: int) -> dict[str, int]:

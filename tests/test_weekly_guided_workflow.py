@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+import json
 
 import pytest
 
@@ -7,6 +8,7 @@ from lms_optimizer.storage import Repository
 from lms_optimizer.workflow import LMSWorkflow
 from lms_optimizer.forecast_snapshot import ForecastStore
 from lms_optimizer.weekly import RecommendationSnapshot, WeeklyStore
+from lms_optimizer.providers import ProviderBookmaker, ProviderEvent, ProviderOutcome, ProviderResponse
 
 
 def setup_service(tmp_path):
@@ -72,3 +74,15 @@ def test_recommendation_compare_lock_unlock_preserves_versions_and_audit(tmp_pat
     unlocked = store.unlock(locked.version, "odds changed", datetime.now(timezone.utc))
     assert not unlocked.locked and unlocked.previous_version == locked.version
     assert locked_path.exists() and (store.directory / f"{unlocked.version}.json").exists()
+
+
+def test_provider_refresh_matches_event_id_and_preserves_provenance(tmp_path):
+    service = setup_service(tmp_path); now = datetime.now(timezone.utc)
+    event = ProviderEvent("provider-1", "Home 0", "Away 0", now + timedelta(days=2), (ProviderBookmaker("uk", "UK Book", now, (ProviderOutcome("Home 0", 1.5), ProviderOutcome("Draw", 4.0), ProviderOutcome("Away 0", 6.0))),))
+    response = ProviderResponse("The Odds API v4", "current_odds", now, 200, "abc", {"regions": "uk", "markets": "h2h"}, {"x-requests-remaining": "1"}, str(tmp_path / "raw.json"), (event,))
+    class FakeProvider:
+        def current_odds(self, force_refresh=False): return response
+    result = service.refresh_provider_odds(FakeProvider(), "2026/27", 1)
+    assert result["events"] == 1 and result["bookmakers"] == 1
+    assert service.fixtures()[-1].provider_event_id == "provider-1"
+    assert "abc" in json.dumps(service.repo.list_payloads("raw_imports"))

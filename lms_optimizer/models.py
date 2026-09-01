@@ -29,6 +29,7 @@ class Player(BaseModel):
 
 class Fixture(BaseModel):
     fixture_id: str = Field(min_length=1)
+    provider_event_id: Optional[str] = None
     competition: Literal["Premier League"] = "Premier League"
     season: str = Field(pattern=r"^\d{4}/\d{2}$")
     round_number: int = Field(ge=1)

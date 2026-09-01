@@ -31,7 +31,28 @@ python scripts\evaluate_historical_cartels.py
 Raw datasets, downloaded archives, local databases and large generated
 cohort/decision outputs are intentionally excluded from version control.
 
-The verified foundation provides validated fixture, odds, entry and selection models; deterministic six-match/deadline/reuse rules; SQLite storage with raw-import separation and audit logging; and four margin-removal methods. The dashboard accepts manual three-way odds and labels them as analysis input, not live data.
+The verified foundation provides validated fixture, odds, entry and selection models; deterministic six-match/deadline/reuse rules; SQLite storage with raw-import separation and audit logging; and four margin-removal methods. The dashboard supports manual input and an optional The Odds API v4 provider for current EPL fixtures, UK h2h odds and recent scores. Provider data is cached locally for at least five minutes, raw responses are immutable and ignored by Git, and a force refresh consumes a new provider request.
+
+## Optional automatic EPL refresh
+
+Obtain a key from [The Odds API](https://the-odds-api.com/) and set it only in a local `.env` or process environment:
+
+```powershell
+$env:ODDS_API_KEY = "your-local-key"
+streamlit run main.py
+```
+
+The normal odds refresh requests one `soccer_epl` UK `h2h` decimal market and uses one request credit; cached refreshes do not make a request. The dashboard never displays or stores the key. Without the key, use manual fixture entry, CSV paste and manual results. Provider timestamps mean retrieval time, bookmaker market-update time, and the event kickoff time; they are distinct and are shown separately.
+
+Provider result history is limited by the provider's recent-score window. Unmatched or ambiguous results are proposals only and require manual resolution and confirmation before LMS advancement. If authentication, quota, timeout or network errors occur, the last successful local response remains available where present.
+
+For a read-only smoke test (no bets and no locked-selection changes), run:
+
+```powershell
+python scripts\smoke_odds_api.py
+```
+
+Troubleshooting: confirm `ODDS_API_KEY` is set in the process running Streamlit, wait for the cache window or use the explicit force-refresh control, and check quota headers in the refresh details. Never paste keys into fixture CSV, screenshots, reports or issue descriptions.
 
 All imported records must retain source and collection/market timestamps. Sample
 or demonstration data must be labelled as such. Current limitations include

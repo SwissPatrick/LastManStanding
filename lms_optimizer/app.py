@@ -17,6 +17,7 @@ def run() -> None:
     from .storage import Repository
     from .weekly import RecommendationSnapshot, WeeklyStore
     from .forecast_snapshot import ForecastStore
+    from .providers import OddsApiProvider, ProviderError
     from .workflow import LMSWorkflow
     st.set_page_config(page_title="LMS Weekly Manager", layout="wide")
     st.title("Premier League Last Man Standing")
@@ -59,6 +60,20 @@ def run() -> None:
         if st.button("Continue to fixtures", key="next0"): go(1)
     with tabs[1]:
         st.header("2. Fixtures and odds"); st.caption("Manual and timestamp-unknown odds are never labelled live.")
+        provider = OddsApiProvider()
+        if not provider.api_key: st.info("Automatic Odds API refresh is unavailable because ODDS_API_KEY is not configured. Manual entry and CSV import remain fully supported.")
+        force_provider_refresh = st.checkbox("Force refresh (uses a provider request)", disabled=not bool(provider.api_key) or st.session_state.locked)
+        if st.button("Refresh fixtures and odds", disabled=not bool(provider.api_key) or st.session_state.locked):
+            try:
+                refresh = service.refresh_provider_odds(provider, season, round_number, force_refresh=force_provider_refresh); st.session_state.provider_refresh = refresh
+                if st.session_state.get("snapshot") and not st.session_state.snapshot.locked: st.session_state.draft_outdated = True
+                draft_gate = service.validate_round(season, round_number, "concentrated_favourite")
+                if draft_gate["valid"]: st.session_state.analysis = service.analyse_round(season, round_number, "concentrated_favourite"); st.session_state.draft_outdated = False; st.success("Provider refresh imported data and created a new unlocked validated-default analysis draft.")
+                else: st.warning("Provider refresh imported data, but no recommendation draft was created: " + "; ".join(draft_gate["errors"]))
+            except ProviderError as exc: st.error(str(exc))
+            except Exception: st.error("Automatic fixture refresh failed; use manual entry or CSV import.")
+        if st.session_state.get("provider_refresh"):
+            refresh = st.session_state.provider_refresh; st.json({"provider": refresh["provenance"]["provider"], "retrieved_at": refresh["provenance"]["retrieval_timestamp"], "checksum": refresh["provenance"]["response_checksum"], "quota": refresh["provenance"]["quota_headers"], "from_cache": refresh["from_cache"]}); st.warning("Showing a stale last-successful provider response; manual verification is required.") if refresh.get("stale") else None
         with st.form("fixture_form"):
             fixture_id = st.text_input("Fixture identifier", str(uuid.uuid4())[:8]); home = st.text_input("Home team"); away = st.text_input("Away team"); kickoff_date = st.date_input("Date and kickoff date"); kickoff_time = st.time_input("Kickoff time"); status = st.selectbox("Fixture status", list(FixtureStatus), format_func=lambda x: x.value)
             if st.form_submit_button("Add fixture", disabled=st.session_state.locked):
@@ -143,6 +158,7 @@ def run() -> None:
     with tabs[6]:
         st.header("7. Lock and share"); analysis = st.session_state.analysis
         if analysis:
+            if st.session_state.get("draft_outdated"): st.warning("This unlocked draft is outdated because fixture or odds data changed. Save a new version after review.")
             versions = WeeklyStore().versions()
             if versions:
                 st.subheader("Saved recommendation versions")
@@ -169,6 +185,19 @@ def run() -> None:
         if st.button("Continue to results", key="next6", disabled=not st.session_state.locked): go(7)
     with tabs[7]:
         st.header("8. Record results"); fixtures = [f for f in service.fixtures() if f.season == season and f.round_number == round_number]
+        result_provider = OddsApiProvider()
+        if not result_provider.api_key: st.info("Automatic result refresh is unavailable without ODDS_API_KEY; record results manually.")
+        force_result_refresh = st.checkbox("Force result refresh (uses a provider request)", disabled=not bool(result_provider.api_key) or not st.session_state.locked)
+        if st.button("Refresh results", disabled=not bool(result_provider.api_key) or not st.session_state.locked):
+            try: st.session_state.result_proposals = service.propose_provider_results(result_provider, force_refresh=force_result_refresh); st.success("Provider results proposed for review; no entries were advanced.")
+            except ProviderError as exc: st.error(str(exc))
+            except Exception: st.error("Automatic result refresh failed; record results manually.")
+        if st.session_state.get("result_proposals"):
+            st.subheader("Proposed provider results"); st.dataframe(pd.DataFrame(st.session_state.result_proposals["proposals"]), use_container_width=True)
+            if st.session_state.result_proposals["unmatched"]: st.warning(f"{len(st.session_state.result_proposals['unmatched'])} provider results are unmatched and require manual resolution.")
+            if st.button("Confirm proposed results"):
+                try: st.session_state.survival = service.confirm_provider_results(st.session_state.result_proposals["proposals"]); st.success("Confirmed provider results applied.")
+                except Exception as exc: st.error(str(exc))
         if fixtures:
             chosen = st.selectbox("Fixture to update", [f"{f.fixture_id}: {f.home_team} v {f.away_team}" for f in fixtures]); target = next(f for f in fixtures if f.fixture_id == chosen.split(":")[0]); result_status = st.selectbox("Result status", list(FixtureStatus), format_func=lambda x: x.value); home_goals = st.number_input("Home goals", min_value=0, value=0); away_goals = st.number_input("Away goals", min_value=0, value=0)
             if st.button("Finalise result", disabled=not st.session_state.locked):
