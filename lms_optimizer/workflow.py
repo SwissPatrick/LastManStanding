@@ -6,6 +6,7 @@ from .models import Entry, Fixture, FixtureStatus, OddsQuote, Player, Round, Sea
 from .probability import additive, market_disagreement, proportional, power_method, shin
 from .rules import eligible_fixtures, round_is_open, validate_selection
 from .storage import Repository
+from .simulation import exact_current_round, adaptive_multi_round_simulation
 
 @dataclass(frozen=True)
 class TeamProbability:
@@ -129,3 +130,64 @@ class LMSWorkflow:
                 winner = fixture.home_team if fixture.home_goals > fixture.away_goals else fixture.away_team if fixture.away_goals > fixture.home_goals else None
                 if winner != item["team"]: results[item["entry_id"]] = "eliminated"
         return results
+
+    def validate_round(self, season: str, round_number: int, strategy: str = "concentrated_favourite") -> dict[str, object]:
+        rounds = [Round.model_validate(x) for x in self.repo.list_payloads("rounds") if x["season"] == season and x["round_number"] == round_number]
+        fixtures = [f for f in self.fixtures() if f.season == season and f.round_number == round_number]
+        eligible = eligible_fixtures(fixtures, round_number)
+        errors = []
+        if not rounds: errors.append("Create the selected round first.")
+        else:
+            deadline = rounds[-1].selection_deadline
+            if deadline.tzinfo is None: errors.append("Selection deadline must include a timezone.")
+        if len(eligible) < 6: errors.append(f"Only {len(eligible)} eligible fixtures; six are required.")
+        quotes = self.odds(); by_fixture = {f.fixture_id: [q for q in quotes if q.fixture_id == f.fixture_id] for f in eligible}
+        if any(not rows for rows in by_fixture.values()): errors.append("Every eligible fixture needs at least one odds quote.")
+        entries = [e for e in self.entries() if e.season == season and e.active]
+        if not entries: errors.append("Create at least one active entry.")
+        if any(not self.available_teams(e.entry_id, round_number) for e in entries): errors.append("Each active entry needs an eligible unused team.")
+        if strategy in {"bellman", "balanced"} and not self.repo.list_payloads("raw_imports"):
+            errors.append("Future-value strategies require a saved forecast snapshot.")
+        return {"valid": not errors, "errors": errors, "eligible_fixture_count": len(eligible), "six_match_rule": len(eligible) >= 6, "active_entry_count": len(entries), "odds_complete": all(bool(rows) for rows in by_fixture.values()), "timezone": str(rounds[-1].selection_deadline.tzinfo) if rounds else ""}
+
+    def analyse_round(self, season: str, round_number: int, strategy: str = "concentrated_favourite") -> dict[str, object]:
+        gate = self.validate_round(season, round_number, strategy)
+        if not gate["valid"]: raise ValueError("; ".join(gate["errors"]))
+        entries = [e for e in self.entries() if e.season == season and e.active]
+        probabilities = self.team_probabilities(round_number)
+        scored = {row.team: row.proportional for row in probabilities}
+        allocation, backups = {}, {}
+        for entry in entries:
+            teams = sorted(self.available_teams(entry.entry_id, round_number), key=lambda team: (-scored.get(team, 0.0), team))
+            allocation[entry.entry_id] = teams[0]; backups[entry.entry_id] = teams[1] if len(teams) > 1 else None
+        fixture_probabilities = {}; fixture_teams = {}
+        for fixture in eligible_fixtures(self.fixtures(), round_number):
+            quotes = [q for q in self.odds() if q.fixture_id == fixture.fixture_id]
+            consensus = [sum(getattr(q, side) for q in quotes) / len(quotes) for side in ("home", "draw", "away")]
+            fixture_probabilities[fixture.fixture_id] = proportional(consensus); fixture_teams[fixture.fixture_id] = (fixture.home_team, fixture.away_team)
+        risk = exact_current_round(allocation, fixture_probabilities, fixture_teams)
+        return {"allocation": allocation, "backups": backups, "probabilities": [row.__dict__ for row in probabilities], "exposure": self.exposure(round_number), "risk": risk, "strategy": strategy, "objective_weights": {"expected_survivors": 0.0, "at_least_one": 0.0, "wipeout": 0.0, "future_value": 0.0, "concentration": 0.0, "cvar": 0.0}}
+
+    def save_recommendation_selections(self, allocation: dict[str, str], backups: dict[str, str | None], round_number: int) -> None:
+        """Persist reviewed picks through the service boundary before locking."""
+        existing = {(row["entry_id"], row["round_number"], row["is_backup"]) for row in self.repo.list_payloads("selections")}
+        for entry_id, team in allocation.items():
+            key = (entry_id, round_number, False)
+            if key not in existing:
+                payload = {"entry_id": entry_id, "round_number": round_number, "team": team, "is_backup": False, "selected_at": datetime.now(timezone.utc).isoformat(), "result": "pending"}
+                self.repo.save_selection(payload); self.repo.audit("recommendation_selection_saved", payload)
+            backup = backups.get(entry_id)
+            if backup and (entry_id, round_number, True) not in existing:
+                payload = {"entry_id": entry_id, "round_number": round_number, "team": backup, "is_backup": True, "selected_at": datetime.now(timezone.utc).isoformat(), "result": "pending"}
+                self.repo.save_selection(payload); self.repo.audit("recommendation_backup_saved", payload)
+
+    def record_results_and_advance(self, fixture_id: str, status: FixtureStatus, home_goals: int | None = None, away_goals: int | None = None) -> dict[str, str]:
+        self.record_fixture_status(fixture_id, status, home_goals, away_goals)
+        survival = self.survival()
+        for entry_id, state in survival.items():
+            if state == "eliminated":
+                for entry in self.entries():
+                    if entry.entry_id == entry_id:
+                        self.repo.save_entry(entry.model_copy(update={"active": False}))
+        self.repo.audit("results_finalised", {"fixture_id": fixture_id, "survival": survival})
+        return survival

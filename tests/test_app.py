@@ -23,3 +23,11 @@ def test_dashboard_can_submit_season_form(tmp_path, monkeypatch):
     widget_by_label(app.text_input, "Season").set_value("2026/27")
     widget_by_label(app.button, "Create / update season").click().run()
     assert any("Season saved" in alert.value for alert in app.success)
+
+
+def test_dashboard_loads_deterministic_dry_run_fixture(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    app = AppTest.from_file(APP).run()
+    widget_by_label(app.button, "Load deterministic historical dry-run").click().run()
+    assert not app.exception
+    assert any("Historical dry-run data loaded" in alert.value for alert in app.success)
