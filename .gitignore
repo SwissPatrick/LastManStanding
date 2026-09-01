@@ -31,5 +31,6 @@ data/historical_cartel_cohorts.csv
 data/historical_cartel_decisions.csv
 data/historical_cartel_evaluation.json
 data/round_construction_audit.csv
+data/fixture_audit/
 *.tmp
 *.log
