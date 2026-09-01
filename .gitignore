@@ -33,5 +33,6 @@ data/historical_cartel_evaluation.json
 data/round_construction_audit.csv
 data/fixture_audit/
 data/historical_cartel_evaluation_cvar/
+data/heterogeneous_cartel_evaluation/
 *.tmp
 *.log

@@ -14,6 +14,7 @@ from typing import Any
 
 VOLATILE_FIELDS = frozenset({
     "generated_at", "generation_timestamp", "runtime_seconds", "output_directory",
+    "milp_runtime_seconds", "milp_mean_runtime_seconds", "mean_runtime_seconds", "maximum_runtime_seconds", "total_runtime_seconds",
     "temporary_path", "temp_path", "process_id", "pid",
 })
 MISSING_VALUE = ""
