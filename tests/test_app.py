@@ -10,6 +10,7 @@ def button(app, label):
 
 def test_first_time_user_sees_simple_setup(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("LMS_DATABASE_PATH", str(tmp_path / "data" / "lms.sqlite3"))
     app = AppTest.from_file(APP).run()
     assert not app.exception
     assert app.title[0].value == "Welcome to Last Man Standing"
@@ -19,6 +20,7 @@ def test_first_time_user_sees_simple_setup(tmp_path, monkeypatch):
 
 def test_setup_leads_to_single_home_action(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("LMS_DATABASE_PATH", str(tmp_path / "data" / "lms.sqlite3"))
     app = AppTest.from_file(APP).run()
     button(app, "Finish setup").click().run()
     assert not app.exception
@@ -28,6 +30,7 @@ def test_setup_leads_to_single_home_action(tmp_path, monkeypatch):
 
 def test_advanced_mode_keeps_dry_run_and_manual_tools_available(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("LMS_DATABASE_PATH", str(tmp_path / "data" / "lms.sqlite3"))
     app = AppTest.from_file(APP).run()
     button(app, "Finish setup").click().run()
     button(app, "Settings").click().run()
@@ -38,6 +41,7 @@ def test_advanced_mode_keeps_dry_run_and_manual_tools_available(tmp_path, monkey
 
 def test_normal_mode_does_not_show_technical_controls(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("LMS_DATABASE_PATH", str(tmp_path / "data" / "lms.sqlite3"))
     app = AppTest.from_file(APP).run()
     button(app, "Finish setup").click().run()
     assert not app.exception

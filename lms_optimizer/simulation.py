@@ -32,6 +32,30 @@ def exact_current_round(allocation: dict[str, str], fixture_probabilities: dict[
     cvar = _formal_cvar(losses, probabilities, alpha, "eliminated entries")
     return {"survivor_counts": counts, "probabilities": probabilities, "expected_survivors": expected, "probability_at_least_one": any_survive, "wipeout_probability": wipeout, "cvar_eliminated": cvar.cvar, "cvar": cvar.as_dict()}
 
+
+def exact_cartel_summary(allocation: dict[str, str], member_by_entry: dict[str, str], fixture_probabilities: dict[str, np.ndarray], fixture_teams: dict[str, tuple[str, str]]) -> dict[str, object]:
+    """Exact current-round cartel and member survival probabilities."""
+    fixtures = list(fixture_probabilities)
+    if len(fixtures) > 10:
+        raise ValueError("exact enumeration is limited to ten fixtures")
+    cartel = 0.0; members = {member: 0.0 for member in set(member_by_entry.values())}; every_member = 0.0
+    for outcomes in product(range(3), repeat=len(fixtures)):
+        probability = 1.0; winners = set()
+        for fixture_id, outcome in zip(fixtures, outcomes):
+            p = np.asarray(fixture_probabilities[fixture_id], dtype=float); p = p / p.sum(); probability *= p[outcome]
+            home, away = fixture_teams[fixture_id]
+            if outcome == 0: winners.add(home)
+            elif outcome == 2: winners.add(away)
+        survivors = {entry for entry, team in allocation.items() if team in winners}
+        if survivors: cartel += probability
+        surviving_members = set()
+        for member in members:
+            if any(entry in survivors for entry, owner in member_by_entry.items() if owner == member):
+                members[member] += probability
+                surviving_members.add(member)
+        if surviving_members == set(members): every_member += probability
+    return {"probability_at_least_one": float(cartel), "probability_every_member": float(every_member), "member_survival": members}
+
 @dataclass
 class AdaptiveSimulationSummary:
     survivor_counts: np.ndarray

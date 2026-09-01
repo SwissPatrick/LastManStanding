@@ -1,7 +1,18 @@
 """Simple weekly Streamlit journey; business operations stay in LMSWorkflow."""
 from datetime import datetime, timezone
 from pathlib import Path
+import os
 import uuid
+
+APP_ROOT = Path(__file__).resolve().parents[1]
+
+def _database_path() -> Path:
+    configured = os.environ.get("LMS_DATABASE_PATH")
+    return Path(configured).expanduser().resolve() if configured else APP_ROOT / "data" / "lms.sqlite3"
+
+def _recommendation_dir() -> Path:
+    configured = os.environ.get("LMS_RECOMMENDATIONS_PATH")
+    return Path(configured).expanduser().resolve() if configured else APP_ROOT / "data" / "recommendations"
 
 
 def _error(st, exc):
@@ -15,13 +26,20 @@ def _state(st, service):
     st.session_state.setdefault("analysis", None)
     existing_locked = st.session_state.get("locked")
     st.session_state.setdefault("snapshot", None)
-    st.session_state.setdefault("round_number", 1)
     entries = service.entries()
     st.session_state.setdefault("setup_complete", bool(entries))
-    if entries: st.session_state.setdefault("season", entries[0].season)
+    persisted_season, persisted_round = service.current_context()
+    if persisted_season: st.session_state.setdefault("season", persisted_season)
+    st.session_state.setdefault("round_number", persisted_round)
+    if st.session_state.get("round_number") == 1 and persisted_round != 1: st.session_state.round_number = persisted_round
+    if st.session_state.get("analysis") is None and st.session_state.get("season"):
+        try:
+            gate = service.validate_round(st.session_state.season, st.session_state.round_number)
+            if gate["valid"]: st.session_state.analysis = service.analyse_round(st.session_state.season, st.session_state.round_number)
+        except Exception: pass
     if entries and existing_locked is None:
         from .weekly import WeeklyStore
-        st.session_state.locked = any(x.locked and x.season == st.session_state.get("season") and x.round_number == st.session_state.get("round_number", 1) for x in WeeklyStore().versions())
+        st.session_state.locked = any(x.locked and x.season == st.session_state.get("season") and x.round_number == st.session_state.get("round_number", 1) for x in WeeklyStore(_recommendation_dir()).versions())
     else:
         st.session_state.setdefault("locked", False)
 
@@ -40,18 +58,20 @@ def _setup(st, service):
     with st.form("setup_form"):
         competition = st.text_input("Competition name", "Premier League Last Man Standing")
         season = st.text_input("Season", "2026/27")
-        count = int(st.number_input("Number of players", min_value=1, max_value=20, value=1))
-        names = [st.text_input(f"Player {i + 1}", f"Player {i + 1}") for i in range(count)]
-        entries = [int(st.number_input(f"Entries for {name or f'Player {i + 1}'}", min_value=1, max_value=10, value=1, key=f"entry_count_{i}")) for i, name in enumerate(names)]
+        st.subheader("Our cartel")
+        st.caption("There are five permanent family members. Enter their actual names and each person's number of entries.")
+        names = [st.text_input(label, key=f"member_name_{i}") for i, label in enumerate(("Your name", "Your brother's name", "Your dad's name", "Your uncle's name", "Your cousin's name"))]
+        entries = [int(st.number_input(f"Entries for {name or label}", min_value=1, max_value=10, value=1, key=f"entry_count_{i}")) for i, (name, label) in enumerate(zip(names, ("You", "Your brother", "Your dad", "Your uncle", "Your cousin")))]
         if st.form_submit_button("Finish setup"):
             try:
-                from .models import Entry, Player, Season
+                from .models import Entry, FamilyMember, Player, Season
                 service.create_season(Season(season=season, name=competition))
                 from .models import Round
                 service.create_round(Round(season=season, round_number=1, selection_deadline=datetime.now(timezone.utc)))
-                for name, amount in zip(names, entries):
-                    pid = str(uuid.uuid4()); service.add_player(Player(player_id=pid, name=name.strip() or "Player"))
-                    for _ in range(amount): service.add_entry(Entry(entry_id=str(uuid.uuid4()), player=pid, season=season))
+                for position, (name, amount) in enumerate(zip(names, entries), 1):
+                    member_id = str(uuid.uuid4()); friendly_name = name.strip() or ("You" if position == 1 else ["", "Brother", "Dad", "Uncle", "Cousin"][position - 1])
+                    service.add_family_member(FamilyMember(member_id=member_id, name=friendly_name, position=position))
+                    for _ in range(amount): service.add_entry(Entry(entry_id=str(uuid.uuid4()), member_id=member_id, season=season))
                 st.session_state.update(season=season, setup_complete=True, page="Home")
                 st.success("Setup complete. Now get this week's matches."); st.rerun()
             except Exception as exc: _error(st, exc)
@@ -61,22 +81,37 @@ def _save_draft(service, analysis, season, number, st):
     from .weekly import RecommendationSnapshot, WeeklyStore
     now = datetime.now(timezone.utc); version = now.strftime("%Y%m%dT%H%M%S%fZ")
     snap = RecommendationSnapshot(version=version, created_at=now, season=season, round_number=number, odds_snapshot_version=f"odds-{len(service.odds())}", forecast_snapshot_version="not-required", active_entries=list(analysis["allocation"]), used_teams={e: service.used_teams(e) for e in analysis["allocation"]}, objective_weights=analysis["objective_weights"], exposure_limits={}, simulation_settings={}, seed=7, optimiser_version="weekly-service", allocation=analysis["allocation"], backups=analysis["backups"], odds_snapshot={q.fixture_id: q.model_dump() for q in service.odds()}, probabilities={r["team"]: r["proportional"] for r in analysis["probabilities"]}, exact_risk={k: (v.tolist() if hasattr(v, "tolist") else v) for k, v in analysis["risk"].items()}, risk_estimates={"expected_survivors": float(analysis["risk"]["expected_survivors"])})
-    WeeklyStore().save(snap); st.session_state.snapshot = snap
+    _recommendation_dir().mkdir(parents=True, exist_ok=True); WeeklyStore(_recommendation_dir()).save(snap); st.session_state.snapshot = snap
 
 
 def _home(st, service):
     season, number, fixtures, entries = _current(st, service)
     if not season or not entries: return _setup(st, service)
     st.title("Your LMS week"); st.subheader(f"Round {number}")
+    members = service.family_members(); total = len([e for e in service.entries() if e.season == season]); alive = len([e for e in service.entries() if e.season == season and e.active])
+    st.markdown(f"### OUR CARTEL\n{len(members)} family members • {total} total entries • {alive} still alive")
+    field = service.wider_field(season, number)
+    st.markdown(f"### WIDER FIELD\n{field.surviving_entries} entries remain" if field else "### WIDER FIELD\nNo field size recorded yet")
     rounds = [r for r in service.repo.list_payloads("rounds") if r.get("season") == season and r.get("round_number") == number]
     deadline = "Not set"
     if rounds: deadline = datetime.fromisoformat(rounds[-1]["selection_deadline"]).astimezone().strftime("%a %d %b, %H:%M")
     c1, c2, c3 = st.columns(3); c1.metric("Deadline", deadline); c2.metric("Active entries", len(entries)); c3.metric("Odds freshness", "Ready" if fixtures else "Not loaded")
+    st.write(f"### THIS WEEK\n{len(entries)} selections required • Deadline {deadline}")
+    with st.form("update_field_size"):
+        field_count = st.number_input("Current surviving outside entries", min_value=0, value=field.surviving_entries if field else 0, step=1)
+        if st.form_submit_button("Update field size"):
+            from .models import WiderFieldSnapshot
+            try:
+                starting = field.starting_entries if field else int(field_count)
+                service.save_wider_field(WiderFieldSnapshot(season=season, round_number=number, starting_entries=starting, surviving_entries=int(field_count), recorded_at=datetime.now(timezone.utc)))
+                st.success("Wider field size updated."); st.rerun()
+            except Exception as exc: _error(st, exc)
     if st.session_state.get("locked"):
         message, action, page = ("Selections are locked. Share them with your group.", "Copy WhatsApp message", "Share") if not any(f.status.value == "played" for f in fixtures) else ("Matches have finished. Record the results to update entries.", "Enter results", "Results")
     elif st.session_state.get("analysis"):
         message, action, page = "Picks are ready for review.", "Review and confirm", "Confirm"
-    elif fixtures: message, action, page = "Fixtures are ready.", "Show our best picks", "Choose"
+    elif fixtures and service.odds(): message, action, page = "Fixtures are ready.", "Show our best picks", "Choose"
+    elif fixtures: message, action, page = "The matches are ready, but we still need the latest odds.", "Get latest odds", "Get"
     else: message, action, page = "This round has no matches yet.", "Get this week's matches", "Get"
     st.info(message)
     if st.button(action, type="primary", key="home_primary"): st.session_state.page = page; st.rerun()
@@ -87,9 +122,11 @@ def _get(st, service):
     st.title("Get matches"); st.write("We'll find this week's Premier League matches and the latest available odds.")
     provider = OddsApiProvider()
     if not provider.api_key:
-        st.warning("Automatic matches are not configured yet. You can use cached matches or enable Advanced mode for manual entry.")
-        if st.button("Use cached odds", type="primary"): st.info("No cached provider snapshot is available yet.")
+        st.error("The automatic football-data connection has not been configured.")
+        st.code("Add ODDS_API_KEY=your-local-key to .env, then restart Streamlit.")
+        if st.button("Try again", type="primary"): st.rerun()
         if st.button("Enter matches manually"): st.session_state.update(advanced=True, page="Settings"); st.rerun()
+        return
     if st.session_state.get("locked"):
         st.info("This round is locked. Start the next round before refreshing matches.")
     elif st.button("Get this week's matches", type="primary"):
@@ -114,22 +151,52 @@ def _get(st, service):
                         st.session_state.analysis = service.analyse_round(season, number); _save_draft(service, st.session_state.analysis, season, number, st)
                 st.session_state.page = "Choose"; st.rerun()
             except Exception as exc: _error(st, exc)
+    else:
+        st.info("This week's matches haven't been loaded yet.")
 
 
 def _choose(st, service):
-    st.title(f"Our recommended selections for Round {st.session_state.round_number}")
     analysis = st.session_state.get("analysis")
-    if not analysis: st.warning("Get this week's matches first."); return
-    players = {x["player_id"]: x["name"] for x in service.repo.list_payloads("players")}; probs = {r["team"]: r["proportional"] for r in analysis["probabilities"]}
-    for index, entry in enumerate(service.entries(), 1):
-        if entry.season != st.session_state.season or not entry.active: continue
-        team, backup = analysis["allocation"].get(entry.entry_id), analysis["backups"].get(entry.entry_id)
+    if not analysis:
+        season, number, fixtures, entries = _current(st, service)
+        st.title(f"Let's prepare Round {number}")
+        gate = service.validate_round(season, number) if season else {"eligible_fixture_count": 0}
+        if fixtures and gate.get("eligible_fixture_count", 0) < 6:
+            with st.container(border=True):
+                st.subheader("No selection is required this week")
+                st.write(f"Only {gate.get('eligible_fixture_count', 0)} eligible matches are scheduled, so no selection is required under your LMS rules.")
+                if st.button("Return home", type="primary"): st.session_state.page = "Home"; st.rerun()
+            return
         with st.container(border=True):
-            st.subheader(f"{players.get(entry.player, 'Player')} · Entry {index}")
-            st.write(f"**{team}** — {probs.get(team, 0):.0%} chance of winning"); st.write(f"Backup: {backup or 'None'}")
-            st.caption("This is the strongest available market favourite and has not previously been used by this entry.")
+            st.subheader("This week's selections are not ready")
+            st.write("We need the current fixtures and odds before we can generate recommendations.")
+            st.write("✅ Family entries checked" if entries else "⬜ Add your family's entries")
+            st.write("✅ Fixtures loaded" if fixtures else "⬜ Fixtures still need to be loaded")
+            st.write("✅ Odds available" if service.odds() else "⬜ Latest odds still need to be retrieved")
+            if not entries:
+                if st.button("Set up our entries", type="primary"): st.session_state.page = "Home"; st.rerun()
+            elif not fixtures or not service.odds():
+                action = "Get latest odds" if fixtures else "Get this week's matches"
+                if st.button(action, type="primary"): st.session_state.page = "Get"; st.rerun()
+            if st.button("Return home"): st.session_state.page = "Home"; st.rerun()
+        return
+    st.title(f"Our recommended selections for Round {st.session_state.round_number}")
+    probs = {r["team"]: r["proportional"] for r in analysis["probabilities"]}
+    for member, recommendations in analysis.get("recommendations_by_member", {}).items():
+        st.subheader(member)
+        for item in recommendations:
+            team, backup = item["team"], item["backup"]
+            with st.container(border=True):
+                st.write(f"**{member} — {item['label']}**: {team}")
+                st.caption(f"Backup: {backup or 'None'} · {probs.get(team, 0):.0%} chance of winning")
     risk = analysis["risk"]; st.subheader("This round's risk")
-    st.write(f"Chance at least one entry survives: **{risk['probability_at_least_one']:.0%}**"); st.write(f"Chance all entries lose: **{risk['wipeout_probability']:.0%}**")
+    cartel = analysis.get("cartel_risk", {})
+    st.write(f"Chance at least one cartel entry survives: **{cartel.get('probability_at_least_one', risk['probability_at_least_one']):.0%}**")
+    st.write(f"Chance every family member retains at least one entry: **{cartel.get('probability_every_member', 0):.0%}**")
+    if analysis.get("competition_winning_probability") is not None:
+        st.write(f"Estimated competition-winning probability: **{analysis['competition_winning_probability']:.2%}**")
+    field = service.wider_field(st.session_state.season, st.session_state.round_number)
+    st.caption("Competition-winning probability is estimated because outside selections are unavailable." if not field or not field.known_selections else "Competition-winning probability uses the recorded wider-field selections and remains an estimate.")
     st.caption("Worst-case round risk is the number of entries that could be lost in this round. This is exact for the supplied probabilities.")
     if st.button("Review these picks", type="primary"): st.session_state.page = "Confirm"; st.rerun()
     with st.expander("Explore other strategies"): st.caption("Experimental alternatives are available in Advanced mode. The recommended picks use the validated default.")
@@ -138,16 +205,17 @@ def _choose(st, service):
 def _confirm(st, service):
     st.title("Confirm and share"); analysis = st.session_state.get("analysis")
     if not analysis: st.warning("There are no picks to review yet."); return
-    players = {x["player_id"]: x["name"] for x in service.repo.list_payloads("players")}
+    members = {x.member_id: x.name for x in service.family_members()}
     for index, entry in enumerate(service.entries(), 1):
         if entry.season == st.session_state.season and entry.active:
-            st.write(f"✅ **{players.get(entry.player, 'Player')} · Entry {index}** — {analysis['allocation'].get(entry.entry_id)} (backup: {analysis['backups'].get(entry.entry_id) or 'none'})")
+            owner = members.get(service.entry_owner(entry), "Family member")
+            st.write(f"✅ **{owner} — Entry {index}** — {analysis['allocation'].get(entry.entry_id)} (backup: {analysis['backups'].get(entry.entry_id) or 'none'})")
             st.caption("Previously used: " + (", ".join(service.used_teams(entry.entry_id)) or "None"))
     st.checkbox("I have checked every pick and backup", key="confirmed_review")
     if st.button("Lock our selections", type="primary", disabled=not st.session_state.get("confirmed_review")):
         try:
             from .weekly import RecommendationSnapshot, WeeklyStore
-            _save_draft(service, analysis, st.session_state.season, st.session_state.round_number, st); path = WeeklyStore().lock(st.session_state.snapshot.version); st.session_state.snapshot = RecommendationSnapshot.model_validate_json(path.read_text())
+            _save_draft(service, analysis, st.session_state.season, st.session_state.round_number, st); path = WeeklyStore(_recommendation_dir()).lock(st.session_state.snapshot.version); st.session_state.snapshot = RecommendationSnapshot.model_validate_json(path.read_text())
             service.save_recommendation_selections(analysis["allocation"], analysis["backups"], st.session_state.round_number); st.session_state.locked = True; st.success("Selections locked. They cannot be changed silently."); st.rerun()
         except Exception as exc: _error(st, exc)
     if st.session_state.get("locked"):
@@ -218,7 +286,7 @@ def run() -> None:
     from .workflow import LMSWorkflow
     st.set_page_config(page_title="LMS Weekly Manager", page_icon="⚽", layout="wide", initial_sidebar_state="collapsed")
     st.markdown("<style>.block-container{max-width:980px;padding-top:2rem;padding-left:1.2rem;padding-right:1.2rem}@media(max-width:700px){.block-container{padding:1rem .7rem}h1{font-size:1.8rem}}</style>", unsafe_allow_html=True)
-    service = LMSWorkflow(Repository(Path("data/lms.sqlite3"))); _state(st, service)
+    service = LMSWorkflow(Repository(_database_path())); _state(st, service)
     if not st.session_state.setup_complete: _setup(st, service); return
     with st.sidebar:
         st.title("LMS")
@@ -233,8 +301,8 @@ def run() -> None:
     elif page == "Settings": _settings(st, service)
     elif page == "Entries":
         st.title("Entries")
-        players = {x["player_id"]: x["name"] for x in service.repo.list_payloads("players")}
-        for index, e in enumerate(service.entries(), 1): st.write(f"{players.get(e.player, 'Player')} · Entry {index} · {'active' if e.active else 'eliminated'}")
+        members = {x.member_id: x.name for x in service.family_members()}
+        for index, e in enumerate(service.entries(), 1): st.write(f"{members.get(service.entry_owner(e), 'Family member')} — Entry {index} · {'active' if e.active else 'eliminated'}")
         st.subheader("Add a player")
         with st.form("add_player"):
             name = st.text_input("Player name")
@@ -242,10 +310,10 @@ def run() -> None:
                 from .models import Player
                 try: service.add_player(Player(player_id=str(uuid.uuid4()), name=name.strip())); st.success("Player added."); st.rerun()
                 except Exception as exc: _error(st, exc)
-        if players:
+        if members:
             st.subheader("Add an entry")
             with st.form("add_entry"):
-                player_id = st.selectbox("Player", list(players), format_func=lambda value: players[value])
+                player_id = st.selectbox("Family member", list(members), format_func=lambda value: members[value])
                 if st.form_submit_button("Add entry"):
                     from .models import Entry
                     try: service.add_entry(Entry(entry_id=str(uuid.uuid4()), player=player_id, season=st.session_state.season)); st.success("Entry added."); st.rerun()

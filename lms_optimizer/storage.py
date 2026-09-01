@@ -4,12 +4,12 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, TypeVar
-from .models import Entry, Fixture, OddsQuote, Player, Round, Season
+from .models import Entry, FamilyMember, Fixture, OddsQuote, Player, Round, Season, WiderFieldSnapshot
 
 T = TypeVar("T")
 
 class Repository:
-    TABLES = ("seasons", "rounds", "fixtures", "odds_quotes", "players", "entries", "selections", "raw_imports", "audit_log")
+    TABLES = ("seasons", "rounds", "fixtures", "odds_quotes", "players", "family_members", "entries", "selections", "wider_field", "raw_imports", "audit_log")
 
     def __init__(self, path: str | Path = "data/lms.sqlite3") -> None:
         self.path = Path(path)
@@ -23,11 +23,18 @@ class Repository:
             CREATE TABLE IF NOT EXISTS fixtures (fixture_id TEXT PRIMARY KEY, payload TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS odds_quotes (id INTEGER PRIMARY KEY AUTOINCREMENT, fixture_id TEXT NOT NULL, bookmaker TEXT NOT NULL, payload TEXT NOT NULL, UNIQUE(fixture_id, bookmaker));
             CREATE TABLE IF NOT EXISTS players (player_id TEXT PRIMARY KEY, payload TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS family_members (member_id TEXT PRIMARY KEY, payload TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS entries (entry_id TEXT PRIMARY KEY, player_id TEXT NOT NULL, payload TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS selections (id INTEGER PRIMARY KEY AUTOINCREMENT, entry_id TEXT NOT NULL, round_number INTEGER NOT NULL, team TEXT NOT NULL, is_backup INTEGER NOT NULL, payload TEXT NOT NULL, UNIQUE(entry_id, round_number, team, is_backup));
+            CREATE TABLE IF NOT EXISTS wider_field (season TEXT NOT NULL, round_number INTEGER NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(season, round_number));
             CREATE TABLE IF NOT EXISTS raw_imports (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, collected_at TEXT NOT NULL, payload TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, event TEXT NOT NULL, created_at TEXT NOT NULL, payload TEXT NOT NULL);
         """)
+        self.connection.commit()
+        # A non-destructive migration: old players remain untouched and are
+        # copied into the explicit family-member table only when missing.
+        for row in self.connection.execute("SELECT player_id, payload FROM players").fetchall():
+            self.connection.execute("INSERT OR IGNORE INTO family_members(member_id, payload) VALUES (?, ?)", (row[0], row[1]))
         self.connection.commit()
 
     def _save(self, table: str, key_sql: str, values: tuple[object, ...]) -> None:
@@ -52,12 +59,21 @@ class Repository:
     def save_player(self, player: Player) -> None:
         self._save("players", "VALUES (?, ?)", (player.player_id, player.model_dump_json()))
 
+    def save_family_member(self, member: FamilyMember) -> None:
+        self._save("family_members", "VALUES (?, ?)", (member.member_id, member.model_dump_json()))
+        # Keep legacy readers and old snapshots working.
+        self._save("players", "VALUES (?, ?)", (member.member_id, Player(player_id=member.member_id, name=member.name, is_sample=member.is_sample).model_dump_json()))
+
     def save_entry(self, entry: Entry) -> None:
-        self._save("entries", "VALUES (?, ?, ?)", (entry.entry_id, entry.player, entry.model_dump_json()))
+        owner = entry.member_id or entry.player
+        self._save("entries", "VALUES (?, ?, ?)", (entry.entry_id, owner, entry.model_dump_json()))
 
     def save_selection(self, selection: dict[str, object]) -> None:
         self.connection.execute("INSERT INTO selections(entry_id, round_number, team, is_backup, payload) VALUES (?, ?, ?, ?, ?)", (selection["entry_id"], selection["round_number"], selection["team"], int(bool(selection.get("is_backup", False))), json.dumps(selection)))
         self.connection.commit()
+
+    def save_wider_field(self, snapshot: WiderFieldSnapshot) -> None:
+        self._save("wider_field", "VALUES (?, ?, ?)", (snapshot.season, snapshot.round_number, snapshot.model_dump_json()))
 
     def list_payloads(self, table: str) -> list[dict[str, object]]:
         if table not in self.TABLES:

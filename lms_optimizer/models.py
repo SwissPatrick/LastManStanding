@@ -27,6 +27,17 @@ class Player(BaseModel):
     name: str = Field(min_length=1)
     is_sample: bool = False
 
+
+class FamilyMember(BaseModel):
+    """One of the five permanent cartel members.
+
+    ``member_id`` is an internal key; presentation code must use ``name``.
+    """
+    member_id: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    position: int = Field(ge=1, le=5)
+    is_sample: bool = False
+
 class Fixture(BaseModel):
     fixture_id: str = Field(min_length=1)
     provider_event_id: Optional[str] = None
@@ -64,10 +75,36 @@ class OddsQuote(BaseModel):
 
 class Entry(BaseModel):
     entry_id: str = Field(min_length=1)
-    player: str = Field(min_length=1)
+    # player is retained for backwards-compatible database payloads.
+    player: Optional[str] = None
+    member_id: Optional[str] = None
     season: str = Field(pattern=r"^\d{4}/\d{2}$")
     active: bool = True
     is_sample: bool = False
+
+    @field_validator("member_id", mode="after")
+    @classmethod
+    def owner_is_present(cls, value, info):
+        if not value and not info.data.get("player"):
+            raise ValueError("an entry must belong to a family member")
+        return value
+
+
+class WiderFieldSnapshot(BaseModel):
+    """Manual, round-stamped information about the private wider competition."""
+    season: str = Field(pattern=r"^\d{4}/\d{2}$")
+    round_number: int = Field(ge=1)
+    starting_entries: int = Field(ge=0)
+    surviving_entries: int = Field(ge=0)
+    known_selections: Optional[dict[str, int]] = None
+    recorded_at: datetime
+
+    @field_validator("surviving_entries")
+    @classmethod
+    def survivors_cannot_exceed_start(cls, value, info):
+        if "starting_entries" in info.data and value > info.data["starting_entries"]:
+            raise ValueError("surviving entries cannot exceed starting entries")
+        return value
 
 class Selection(BaseModel):
     entry_id: str

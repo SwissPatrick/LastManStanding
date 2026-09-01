@@ -2,11 +2,11 @@
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
-from .models import Entry, Fixture, FixtureStatus, OddsQuote, Player, Round, Season
+from .models import Entry, FamilyMember, Fixture, FixtureStatus, OddsQuote, Player, Round, Season, WiderFieldSnapshot
 from .probability import additive, market_disagreement, proportional, power_method, shin
 from .rules import eligible_fixtures, round_is_open, validate_selection
 from .storage import Repository
-from .simulation import exact_current_round, adaptive_multi_round_simulation
+from .simulation import exact_current_round, exact_cartel_summary, adaptive_multi_round_simulation
 from .forecast_snapshot import ForecastSnapshot, ForecastStore
 from .providers import Provider, ProviderEvent, ProviderError, normalise_team
 import numpy as np
@@ -145,8 +145,29 @@ class LMSWorkflow:
         self.repo.save_player(player)
         self.repo.audit("player_created", player.model_dump())
 
+    def add_family_member(self, member: FamilyMember) -> None:
+        if len(self.family_members()) >= 5 and member.member_id not in {m.member_id for m in self.family_members()}:
+            raise ValueError("the cartel has five permanent family members")
+        self.repo.save_family_member(member)
+        self.repo.audit("family_member_created", member.model_dump())
+
+    def family_members(self) -> list[FamilyMember]:
+        payloads = self.repo.list_payloads("family_members")
+        if not payloads:  # legacy repositories are populated by migration, but be defensive
+            payloads = self.repo.list_payloads("players")
+        return [FamilyMember(member_id=str(x.get("member_id", x.get("player_id"))), name=x["name"], position=int(x.get("position", i + 1)), is_sample=bool(x.get("is_sample", False))) for i, x in enumerate(payloads)]
+
+    def save_wider_field(self, snapshot: WiderFieldSnapshot) -> None:
+        self.repo.save_wider_field(snapshot)
+        self.repo.audit("wider_field_updated", snapshot.model_dump())
+
+    def wider_field(self, season: str, round_number: int) -> WiderFieldSnapshot | None:
+        rows = [WiderFieldSnapshot.model_validate(x) for x in self.repo.list_payloads("wider_field") if x["season"] == season and x["round_number"] == round_number]
+        return rows[-1] if rows else None
+
     def add_entry(self, entry: Entry) -> None:
-        entries = [Entry.model_validate(x) for x in self.repo.list_payloads("entries") if x.get("player") == entry.player]
+        owner = entry.member_id or entry.player
+        entries = [Entry.model_validate(x) for x in self.repo.list_payloads("entries") if (x.get("member_id") or x.get("player")) == owner]
         if len(entries) >= 10:
             raise ValueError("an individual may have at most ten entries")
         self.repo.save_entry(entry)
@@ -155,8 +176,27 @@ class LMSWorkflow:
     def fixtures(self) -> list[Fixture]:
         return [Fixture.model_validate(x) for x in self.repo.list_payloads("fixtures")]
 
+    def current_context(self) -> tuple[str | None, int]:
+        """Resolve competition context from persisted data, not UI state."""
+        entries = self.entries()
+        season = entries[0].season if entries else next((x["season"] for x in self.repo.list_payloads("seasons")), None)
+        rounds = [Round.model_validate(x) for x in self.repo.list_payloads("rounds") if x["season"] == season] if season else []
+        fixture_rounds = [f.round_number for f in self.fixtures() if f.season == season] if season else []
+        return season, max([r.round_number for r in rounds] + fixture_rounds + [1])
+
     def entries(self) -> list[Entry]:
         return [Entry.model_validate(x) for x in self.repo.list_payloads("entries")]
+
+    def entry_owner(self, entry: Entry) -> str:
+        return entry.member_id or entry.player or ""
+
+    def entries_by_member(self, season: str | None = None, active_only: bool = False) -> dict[str, list[Entry]]:
+        grouped: dict[str, list[Entry]] = defaultdict(list)
+        for entry in self.entries():
+            if season and entry.season != season: continue
+            if active_only and not entry.active: continue
+            grouped[self.entry_owner(entry)].append(entry)
+        return dict(grouped)
 
     def odds(self) -> list[OddsQuote]:
         return [OddsQuote.model_validate(x) for x in self.repo.list_payloads("odds_quotes")]
@@ -239,6 +279,15 @@ class LMSWorkflow:
                 if winner != item["team"]: results[item["entry_id"]] = "eliminated"
         return results
 
+    def member_survival(self, season: str | None = None) -> dict[str, str]:
+        """Whether each family member still has at least one live entry."""
+        grouped = self.entries_by_member(season=season)
+        states = {}
+        for owner, entries in grouped.items():
+            states[owner] = "surviving" if any(entry.active for entry in entries) else "eliminated"
+        names = {m.member_id: m.name for m in self.family_members()}
+        return {names.get(owner, owner): state for owner, state in states.items()}
+
     def validate_round(self, season: str, round_number: int, strategy: str = "concentrated_favourite", forecast_version: str | None = None) -> dict[str, object]:
         rounds = [Round.model_validate(x) for x in self.repo.list_payloads("rounds") if x["season"] == season and x["round_number"] == round_number]
         fixtures = [f for f in self.fixtures() if f.season == season and f.round_number == round_number]
@@ -273,7 +322,32 @@ class LMSWorkflow:
             allocation[entry.entry_id] = teams[0]; backups[entry.entry_id] = teams[1] if len(teams) > 1 else None
         fixture_probabilities, fixture_teams = self.simulation_inputs(round_number)
         risk = exact_current_round(allocation, fixture_probabilities, fixture_teams)
-        return {"allocation": allocation, "backups": backups, "probabilities": [row.__dict__ for row in probabilities], "exposure": self.exposure(round_number), "risk": risk, "strategy": strategy, "objective_weights": {"expected_survivors": 0.0, "at_least_one": 0.0, "wipeout": 0.0, "future_value": 0.0, "concentration": 0.0, "cvar": 0.0}}
+        owner = {e.entry_id: self.entry_owner(e) for e in entries}
+        member_risk = exact_cartel_summary(allocation, owner, fixture_probabilities, fixture_teams)
+        # The event-level enumeration is shared, so this is exact rather than
+        # multiplying member probabilities (which would be wrong when picks overlap).
+        member_risk["probability_every_member"] = self._probability_every_member(allocation, owner, fixture_probabilities, fixture_teams)
+        field = self.wider_field(season, round_number)
+        # Outside selections are private, so this is deliberately labelled as
+        # an estimate. It is a conservative share-of-survivors proxy, not an
+        # exact competition calculation.
+        estimated_win = None if field is None else float(member_risk["probability_at_least_one"] / max(1, field.surviving_entries + 1))
+        grouped = defaultdict(list)
+        names = {m.member_id: m.name for m in self.family_members()}
+        for entry in entries: grouped[names.get(owner[entry.entry_id], owner[entry.entry_id])].append({"label": f"Entry {sum(1 for x in entries if owner[x.entry_id] == owner[entry.entry_id] and entries.index(x) <= entries.index(entry))}", "entry_id": entry.entry_id, "team": allocation[entry.entry_id], "backup": backups[entry.entry_id]})
+        return {"allocation": allocation, "backups": backups, "probabilities": [row.__dict__ for row in probabilities], "exposure": self.exposure(round_number), "risk": risk, "cartel_risk": member_risk, "recommendations_by_member": dict(grouped), "competition_winning_probability": estimated_win, "competition_winning_probability_is_estimate": True, "strategy": strategy, "objective_weights": {"expected_survivors": 0.0, "at_least_one": 0.0, "wipeout": 0.0, "future_value": 0.0, "concentration": 0.0, "cvar": 0.0}}
+
+    def _probability_every_member(self, allocation, owner, fixture_probabilities, fixture_teams) -> float:
+        from itertools import product
+        total = 0.0
+        for outcomes in product(range(3), repeat=len(fixture_probabilities)):
+            ptotal = 1.0; winners = set()
+            for fid, outcome in zip(fixture_probabilities, outcomes):
+                p = np.asarray(fixture_probabilities[fid], dtype=float); p /= p.sum(); ptotal *= p[outcome]
+                if outcome == 0: winners.add(fixture_teams[fid][0])
+                elif outcome == 2: winners.add(fixture_teams[fid][1])
+            if all(any(allocation[e] in winners for e, member in owner.items() if member == m) for m in set(owner.values())): total += ptotal
+        return float(total)
 
     def save_recommendation_selections(self, allocation: dict[str, str], backups: dict[str, str | None], round_number: int) -> None:
         """Persist reviewed picks through the service boundary before locking."""
