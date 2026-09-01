@@ -8,9 +8,13 @@ from __future__ import annotations
 from dataclasses import dataclass, asdict
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
+import hashlib
+import json
 import os
 import platform
 import subprocess
+import sys
+import time
 import threading
 import uuid
 
@@ -52,7 +56,10 @@ def detect_hardware() -> HardwareInfo:
     if physical is not None:
         physical = max(1, min(int(physical), logical))
     safe_limit = max(1, logical - 2) if logical > 2 else logical
-    default = min(physical or safe_limit, safe_limit)
+    # Parallelism is an opt-in optimization.  The verified local benchmark is
+    # authoritative for automatic selection; safe hardware limits remain
+    # available for explicit advanced use.
+    default = 1
     return HardwareInfo(logical, physical, memory, safe_limit, max(1, default))
 
 
@@ -89,6 +96,69 @@ def performance_profiles(hardware: HardwareInfo | None = None) -> dict[str, Perf
         "Deep": PerformanceConfig("Deep", 25_000, 2_000_000, 25_000, .002, .01, workers, 7),
         "Maximum": PerformanceConfig("Maximum", 50_000, 10_000_000, 50_000, .001, .005, workers, 7),
     }
+
+
+def benchmark_fingerprint(hardware: HardwareInfo) -> str:
+    payload = {
+        "logical": hardware.logical_cpus,
+        "physical": hardware.physical_cpus,
+        "safe_limit": hardware.safe_logical_limit,
+        "python": sys.version,
+        "platform": platform.platform(),
+        "numpy": __import__("numpy").__version__,
+        "workload": "lms-adaptive-worker-benchmark-v1",
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
+def benchmark_worker_counts(hardware: HardwareInfo | None = None, benchmark_runner=None) -> dict[str, object]:
+    """Measure a representative workload at stable hardware-derived counts."""
+    hardware = hardware or detect_hardware()
+    candidates = sorted({max(1, min(value, hardware.safe_logical_limit)) for value in (1, 4, 8, hardware.safe_logical_limit)})
+    if benchmark_runner is None:
+        from .simulation import adaptive_multi_round_simulation_parallel
+        import numpy as np
+        probabilities = {f"fixture-{i}": np.array([.55, .20, .25]) for i in range(6)}
+        teams = {f"fixture-{i}": (f"Home-{i}", f"Away-{i}") for i in range(6)}
+        allocation = {"e1": "Home-0", "e2": "Home-1", "e3": "Home-2", "e4": "Home-3"}
+        rounds = [(probabilities, teams)]
+        def benchmark_runner(worker_count):
+            started = time.perf_counter()
+            summary = adaptive_multi_round_simulation_parallel(allocation, rounds, PerformanceConfig("benchmark", 4_000, 4_000, 500, .0001, .0004, worker_count, 2718))
+            elapsed = time.perf_counter() - started
+            return {"elapsed_seconds": elapsed, "simulations_per_second": summary.simulations / elapsed, "analytical_hash": hashlib.sha256(summary.survivor_count_histogram.tobytes()).hexdigest(), "converged": summary.converged}
+    results = []
+    for worker_count in candidates:
+        measured = dict(benchmark_runner(worker_count))
+        measured["workers"] = worker_count
+        results.append(measured)
+    return {"fingerprint": benchmark_fingerprint(hardware), "hardware": hardware.__dict__, "results": results}
+
+
+def select_worker_configuration(hardware: HardwareInfo | None = None, cache_dir: str | os.PathLike = "data/benchmarks", benchmark_runner=None) -> dict[str, object]:
+    """Select automatic workers only when parallelism beats serial by 10%."""
+    hardware = hardware or detect_hardware()
+    fingerprint = benchmark_fingerprint(hardware)
+    path = __import__("pathlib").Path(cache_dir) / f"worker-selection-{fingerprint}.json"
+    try:
+        if path.exists():
+            benchmark = json.loads(path.read_text(encoding="utf-8"))
+            if benchmark.get("fingerprint") != fingerprint:
+                raise ValueError("benchmark fingerprint mismatch")
+        else:
+            benchmark = benchmark_worker_counts(hardware, benchmark_runner)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(benchmark, sort_keys=True, indent=2), encoding="utf-8")
+        results = benchmark["results"]
+        serial = next(row for row in results if int(row["workers"]) == 1)
+        fastest = max(results, key=lambda row: float(row["simulations_per_second"]))
+        if int(fastest["workers"]) != 1 and float(fastest["simulations_per_second"]) >= float(serial["simulations_per_second"]) * 1.10:
+            selected = int(fastest["workers"]); reason = "benchmark selected parallel configuration with at least 10% speedup"
+        else:
+            selected = 1; reason = "one worker selected because no parallel configuration beat it by 10%"
+        return {"workers": selected, "reason": reason, "measured_simulations_per_second": float(next(row for row in results if int(row["workers"]) == selected)["simulations_per_second"]), "benchmark": benchmark, "benchmark_path": str(path), "fallback": False}
+    except Exception as exc:
+        return {"workers": 1, "reason": f"one worker fallback because benchmark failed: {exc}", "measured_simulations_per_second": None, "benchmark": None, "benchmark_path": str(path), "fallback": True}
 
 
 def effective_thread_configuration() -> dict[str, int | str]:

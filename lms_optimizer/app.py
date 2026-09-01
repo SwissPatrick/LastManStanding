@@ -18,7 +18,7 @@ def run() -> None:
     from .weekly import RecommendationSnapshot, WeeklyStore
     from .forecast_snapshot import ForecastStore
     from .providers import OddsApiProvider, ProviderError
-    from .performance import PerformanceConfig, SimulationJobService, detect_hardware, effective_thread_configuration, performance_profiles
+    from .performance import PerformanceConfig, SimulationJobService, detect_hardware, effective_thread_configuration, performance_profiles, select_worker_configuration
     from .workflow import LMSWorkflow
     st.set_page_config(page_title="LMS Weekly Manager", layout="wide")
     st.title("Premier League Last Man Standing")
@@ -161,7 +161,7 @@ def run() -> None:
         analysis = st.session_state.analysis
         if analysis:
             risk = analysis["risk"]; st.dataframe(pd.DataFrame(analysis["probabilities"]), use_container_width=True); st.json({k: risk[k] for k in ("expected_survivors", "probability_at_least_one", "wipeout_probability", "cvar", "survivor_counts", "probabilities")}); st.dataframe(pd.DataFrame([{"Entry": e, "Recommended": t, "Backup": analysis["backups"].get(e)} for e, t in analysis["allocation"].items()]), use_container_width=True); st.caption("Risk is exact conditional on supplied fair probabilities; future values are model forecasts.")
-            hardware = detect_hardware(); profiles = performance_profiles(hardware)
+            hardware = detect_hardware(); profiles = performance_profiles(hardware); worker_selection = select_worker_configuration(hardware)
             with st.expander("Adaptive CPU simulation", expanded=False):
                 profile_name = st.selectbox("Performance profile", ["Quick", "Standard", "Deep", "Maximum", "Custom"], index=1)
                 profile = profiles.get(profile_name, profiles["Standard"])
@@ -173,10 +173,18 @@ def run() -> None:
                     confidence_width = float(st.number_input("Confidence-width target", min_value=.000001, value=profile.target_ci_width, format="%.6f"))
                 else:
                     minimum_runs, maximum_runs, batch_size, standard_error, confidence_width = profile.minimum_runs, profile.maximum_runs, profile.batch_size, profile.target_standard_error, profile.target_ci_width
-                worker_count = int(st.number_input("Process workers", min_value=1, max_value=hardware.safe_logical_limit, value=profile.workers))
+                st.caption("Automatic worker selection uses a local representative benchmark. Multiprocessing is available as Experimental — benchmark before use.")
+                worker_count = int(st.number_input("Process workers", min_value=1, max_value=hardware.safe_logical_limit, value=int(worker_selection["workers"])))
                 seed = int(st.number_input("Simulation seed", min_value=0, value=profile.seed))
                 config = PerformanceConfig(profile_name, minimum_runs, maximum_runs, batch_size, standard_error, confidence_width, worker_count, seed)
-                st.json({"hardware": hardware.__dict__, "configuration": config.as_dict(), "thread_configuration": {**effective_thread_configuration(), "configured_process_workers": worker_count, "execution": "CPU-accelerated"}})
+                benchmark_rows = (worker_selection.get("benchmark") or {}).get("results", [])
+                selected_row = next((row for row in benchmark_rows if int(row["workers"]) == int(worker_selection["workers"])), None)
+                measured_rate = selected_row.get("simulations_per_second") if selected_row else worker_selection.get("measured_simulations_per_second")
+                expected_runtime = (maximum_runs / float(measured_rate)) if measured_rate else None
+                manual_row = next((row for row in benchmark_rows if int(row["workers"]) == worker_count), None)
+                if manual_row and selected_row and float(manual_row["simulations_per_second"]) < float(selected_row["simulations_per_second"]):
+                    st.warning("The manually selected worker count was slower in the local benchmark.")
+                st.json({"hardware": hardware.__dict__, "selected_workers": worker_selection["workers"], "selection_reason": worker_selection["reason"], "measured_simulations_per_second": measured_rate, "expected_profile_runtime_seconds": expected_runtime, "configuration": config.as_dict(), "thread_configuration": {**effective_thread_configuration(), "configured_process_workers": worker_count, "execution": "CPU-accelerated"}})
                 if st.button("Start adaptive simulation"):
                     try:
                         inputs = service.simulation_inputs(round_number)

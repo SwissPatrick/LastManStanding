@@ -6,7 +6,7 @@ import threading
 import numpy as np
 import pytest
 
-from lms_optimizer.performance import PerformanceConfig, SimulationJobService, detect_hardware, performance_profiles
+from lms_optimizer.performance import HardwareInfo, PerformanceConfig, SimulationJobService, benchmark_worker_counts, detect_hardware, performance_profiles, select_worker_configuration
 from lms_optimizer.simulation import adaptive_multi_round_simulation_parallel, deterministic_child_seed
 
 
@@ -36,6 +36,42 @@ def test_worker_limit_validation():
 def test_child_seeds_are_stable_and_batch_specific():
     assert deterministic_child_seed(7, 4) == deterministic_child_seed(7, 4)
     assert deterministic_child_seed(7, 4) != deterministic_child_seed(7, 5)
+
+
+def test_current_benchmark_selects_one_worker(tmp_path):
+    hardware = HardwareInfo(20, 14, 1_000_000, 18, 1)
+    result = select_worker_configuration(hardware, tmp_path, lambda workers: {"simulations_per_second": {1: 9392, 4: 6724, 8: 6749, 18: 6789}[workers]})
+    assert result["workers"] == 1 and "10%" in result["reason"]
+
+
+def test_slower_parallel_configurations_are_rejected(tmp_path):
+    hardware = HardwareInfo(20, 14, 1_000_000, 18, 1)
+    result = select_worker_configuration(hardware, tmp_path, lambda workers: {1: {"simulations_per_second": 100}, 4: {"simulations_per_second": 105}, 8: {"simulations_per_second": 108}, 18: {"simulations_per_second": 109}}[workers])
+    assert result["workers"] == 1
+
+
+def test_genuinely_faster_parallel_configuration_is_selected(tmp_path):
+    hardware = HardwareInfo(20, 14, 1_000_000, 18, 1)
+    result = select_worker_configuration(hardware, tmp_path, lambda workers: {1: {"simulations_per_second": 100}, 4: {"simulations_per_second": 125}, 8: {"simulations_per_second": 110}, 18: {"simulations_per_second": 115}}[workers])
+    assert result["workers"] == 4
+
+
+def test_failed_or_missing_benchmark_falls_back_to_one(tmp_path, monkeypatch):
+    hardware = HardwareInfo(20, 14, 1_000_000, 18, 1)
+    result = select_worker_configuration(hardware, tmp_path, lambda workers: (_ for _ in ()).throw(RuntimeError("benchmark unavailable")))
+    assert result["workers"] == 1 and result["fallback"]
+    missing = select_worker_configuration(hardware, tmp_path / "missing", lambda workers: (_ for _ in ()).throw(FileNotFoundError("missing")))
+    assert missing["workers"] == 1 and missing["fallback"]
+
+
+def test_worker_selection_cache_is_reused(tmp_path):
+    hardware = HardwareInfo(20, 14, 1_000_000, 18, 1); calls = []
+    def runner(workers):
+        calls.append(workers)
+        return {"simulations_per_second": {1: 100, 4: 90, 8: 80, 18: 70}[workers]}
+    first = select_worker_configuration(hardware, tmp_path, runner)
+    second = select_worker_configuration(hardware, tmp_path, lambda workers: (_ for _ in ()).throw(RuntimeError("must use cache")))
+    assert first["workers"] == second["workers"] == 1 and calls == [1, 4, 8, 18]
 
 
 def test_serial_and_process_results_are_identical():
