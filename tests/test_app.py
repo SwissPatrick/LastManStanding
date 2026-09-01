@@ -1,44 +1,45 @@
-from streamlit.testing.v1 import AppTest
 from pathlib import Path
+from streamlit.testing.v1 import AppTest
 
 APP = Path(__file__).parents[1] / "main.py"
 
-def widget_by_label(widgets, label):
-    return next(widget for widget in widgets if widget.label == label)
+
+def button(app, label):
+    return next(item for item in app.button if item.label == label)
 
 
-def test_dashboard_renders_manual_workflow_controls(tmp_path, monkeypatch):
+def test_first_time_user_sees_simple_setup(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     app = AppTest.from_file(APP).run()
     assert not app.exception
-    assert app.title[0].value == "Premier League Last Man Standing"
-    assert widget_by_label(app.button, "Create / update season")
-    assert widget_by_label(app.button, "Add fixture")
-    assert any("Selections and backups" in heading.value for heading in app.header)
+    assert app.title[0].value == "Welcome to Last Man Standing"
+    assert button(app, "Finish setup")
+    assert not any("fixture_id" in str(item.value).lower() for item in app.markdown)
 
 
-def test_dashboard_can_submit_season_form(tmp_path, monkeypatch):
+def test_setup_leads_to_single_home_action(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     app = AppTest.from_file(APP).run()
-    widget_by_label(app.text_input, "Season").set_value("2026/27")
-    widget_by_label(app.button, "Create / update season").click().run()
-    assert any("Season saved" in alert.value for alert in app.success)
-
-
-def test_dashboard_loads_deterministic_dry_run_fixture(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    app = AppTest.from_file(APP).run()
-    widget_by_label(app.button, "Load deterministic historical dry-run").click().run()
+    button(app, "Finish setup").click().run()
     assert not app.exception
-    assert any("Historical dry-run data loaded" in alert.value for alert in app.success)
+    assert app.title[0].value == "Your LMS week"
+    assert button(app, "Get this week's matches")
 
 
-def test_dashboard_exposes_cpu_profile_after_analysis(tmp_path, monkeypatch):
+def test_advanced_mode_keeps_dry_run_and_manual_tools_available(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     app = AppTest.from_file(APP).run()
-    widget_by_label(app.button, "Load deterministic historical dry-run").click().run()
-    widget_by_label(app.button, "Continue to validation").click().run()
-    widget_by_label(app.button, "Continue to analysis").click().run()
-    widget_by_label(app.button, "Run exact analysis").click().run()
-    assert widget_by_label(app.selectbox, "Performance profile")
-    assert widget_by_label(app.number_input, "Process workers")
+    button(app, "Finish setup").click().run()
+    button(app, "Settings").click().run()
+    app.toggle[0].set_value(True).run()
+    assert button(app, "Load deterministic historical dry-run")
+    assert button(app, "Add manual fixture")
+
+
+def test_normal_mode_does_not_show_technical_controls(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    app = AppTest.from_file(APP).run()
+    button(app, "Finish setup").click().run()
+    assert not app.exception
+    widgets = list(app.text_input) + list(app.number_input)
+    assert not any(item.label in {"CSV import", "Process workers", "Performance profile", "Fixture ID"} for item in widgets)
