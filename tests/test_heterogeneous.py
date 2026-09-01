@@ -9,6 +9,8 @@ from lms_optimizer.heterogeneous import (
 )
 from lms_optimizer.historical_evaluator import construct_rounds
 from lms_optimizer.models import HistoricalMatch
+from lms_optimizer.milp import milp_optimize
+from lms_optimizer.optimizer import DynamicProgram, PortfolioOptimizer, PortfolioWeights
 
 
 def match(day, index, home_goals=2, away_goals=0):
@@ -64,3 +66,29 @@ def test_all_seven_strategies_and_milp_twenty_entry_evaluation():
     assert any(row["feasible"] for row in report["cohort_construction"])
     assert all(item["status"] == "success" for evaluation in report["evaluations"] for item in evaluation["milp"])
     assert all(row["cartel_size"] == TOTAL_ENTRIES for row in report["evaluations"])
+
+
+def test_expected_survivors_concentrates_and_protect_one_diversifies():
+    scenarios = [{"A": True, "B": True}, {"A": True}, {"B": True}, {}]
+    probabilities = [.56, .24, .14, .06]
+    candidates = {"e1": ["A", "B"], "e2": ["A", "B"]}
+    maximum = milp_optimize(candidates, scenarios, PortfolioWeights(expected_survivors=1, at_least_one=0, wipeout=0), scenario_probabilities=probabilities)
+    protected = milp_optimize(candidates, scenarios, PortfolioWeights(expected_survivors=0, at_least_one=1, wipeout=0), scenario_probabilities=probabilities)
+    assert maximum.feasible and set(maximum.allocation.values()) == {"A"}
+    assert protected.feasible and set(protected.allocation.values()) == {"A", "B"}
+    assert protected.components["probability_at_least_one"] == pytest.approx(.94)
+    assert maximum.components["expected_survivors"] == pytest.approx(1.6)
+
+
+def test_same_team_correlation_and_concentration_penalty():
+    scenarios = [{"A": True, "B": True}, {"A": True}, {"B": True}, {}]
+    oracle = PortfolioOptimizer({"e1": ["A", "B"], "e2": ["A", "B"]}, scenarios, PortfolioWeights(expected_survivors=1, at_least_one=0, wipeout=0), scenario_probabilities=[.56, .24, .14, .06])
+    assert oracle.components({"e1": "A", "e2": "A"}).expected_survivors == pytest.approx(1.6)
+    diversified = PortfolioOptimizer({"e1": ["A", "B"], "e2": ["A", "B"]}, scenarios, PortfolioWeights(expected_survivors=1, at_least_one=0, wipeout=0, concentration=.1), scenario_probabilities=[.56, .24, .14, .06])
+    assert set(diversified.optimize()[0].values()) == {"A", "B"}
+
+
+def test_bellman_preserves_stronger_future_team():
+    program = DynamicProgram({1: {"A": .8, "B": .79}, 2: {"A": .1, "B": .95}}, {1: ["A", "B"], 2: ["A", "B"]}, horizon=2)
+    # A is used now because Bellman preserves the stronger future B.
+    assert program.solve()[0].team == "A"

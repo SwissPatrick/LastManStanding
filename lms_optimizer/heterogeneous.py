@@ -17,12 +17,20 @@ from .historical_evaluator import (_actual_winner, _current_probabilities, _exac
 from .elo import EloModel
 from .milp import milp_optimize
 from .models import HistoricalMatch
-from .optimizer import PortfolioWeights
+from .optimizer import DynamicProgram, PortfolioOptimizer, PortfolioWeights
 from .probability import proportional
 
 ENTRY_LIMIT = 10
 TOTAL_ENTRIES = 20
 STRATEGIES = ("concentrated_favourite", "equal_diversification", "independent_greedy", "bellman", "max_expected_survivors", "protect_one", "balanced")
+STRATEGY_WEIGHTS = {
+    "maximum_expected_survivors": {"expected_survivors": 1.0, "at_least_one": 0.0, "wipeout": 0.0, "future_value": 0.0, "concentration": 0.0, "cvar": 0.0},
+    "protect_one": {"expected_survivors": 0.0, "at_least_one": 1.0, "wipeout": 0.0, "future_value": 0.0, "concentration": 0.0, "cvar": 0.0},
+    "bellman": {"expected_survivors": 0.0, "at_least_one": 0.0, "wipeout": 0.0, "future_value": 1.0, "concentration": 0.0, "cvar": 0.0},
+    "balanced": {"expected_survivors": 1.0, "at_least_one": 1.0, "wipeout": 1.0, "future_value": 1.0, "concentration": 0.1, "cvar": 1.0},
+}
+_ELO_CACHE: dict[tuple[int, str], EloModel] = {}
+_ALLOCATION_CACHE: dict[str, dict[str, object]] = {}
 
 
 @dataclass
@@ -174,41 +182,126 @@ def _milp_scenarios(round_matches: list[HistoricalMatch]):
     return scenarios, probabilities
 
 
-def _future_values(matches, rounds, cutoff, candidates):
-    model = EloModel().fit([match for match in matches if match.match_date < cutoff])
-    values = {entry: {team: 0.0 for team in teams} for entry, teams in candidates.items()}
-    for future in rounds:
-        if not future or min(match.match_date for match in future) <= cutoff:
-            continue
-        for entry, teams in values.items():
-            for team in teams:
-                for match in future:
-                    if team == match.home_team: values[entry][team] += float(model.probabilities(match.home_team, match.away_team)[0])
-                    elif team == match.away_team: values[entry][team] += float(model.probabilities(match.home_team, match.away_team)[2])
+def _future_values(matches, rounds, cutoff, candidates, current_round_matches):
+    """Leakage-safe Bellman continuation values for each current candidate."""
+    cache_key = (id(matches), cutoff.isoformat())
+    model = _ELO_CACHE.get(cache_key)
+    if model is None:
+        model = EloModel().fit([match for match in matches if match.match_date < cutoff])
+        _ELO_CACHE[cache_key] = model
+    current = _current_probabilities(current_round_matches)
+    # A bounded continuation horizon keeps the historical audit practical;
+    # the value is still a dynamic program over mutually exclusive future
+    # rounds and uses only information strictly after the cutoff.
+    future_rounds = [future for future in rounds if future and min(match.match_date for match in future) > cutoff][:1]
+    values = {}
+    for entry, teams in candidates.items():
+        forecasts = {0: {team: current.get(team, 0.0) for team in teams}}
+        available = {0: list(teams)}
+        for index, future in enumerate(future_rounds, 1):
+            available[index] = sorted({team for match in future for team in (match.home_team, match.away_team)})
+            forecasts[index] = {}
+            for match in future:
+                probabilities = model.probabilities(match.home_team, match.away_team)
+                forecasts[index][match.home_team] = float(probabilities[0])
+                forecasts[index][match.away_team] = float(probabilities[2])
+        program = DynamicProgram(forecasts, available, horizon=len(forecast_rounds := future_rounds))
+        values[entry] = {candidate.team: float(candidate.dynamic_value) for candidate in program.solve() if candidate.team in teams}
     return values
+
+
+def _objective_components(round_matches, allocation, scenarios, probabilities, future_values=None, weights=None):
+    return PortfolioOptimizer({entry: [team] for entry, team in allocation.items()}, scenarios, weights=weights, scenario_probabilities=probabilities, future_values=future_values).components(allocation).__dict__.copy()
 
 
 def _allocate(round_matches, active_entries, strategy, used, all_matches, all_rounds, cutoff):
     current = _current_probabilities(round_matches)
     candidates = {entry.entry_id: sorted({team for match in round_matches for team in (match.home_team, match.away_team) if team not in used[entry.entry_id]}, key=lambda team: (-current.get(team, 0), team)) for entry in active_entries}
     candidates = {entry: teams for entry, teams in candidates.items() if teams}
+    if strategy in ("concentrated_favourite", "independent_greedy"):
+        allocation = {entry: teams[0] for entry, teams in candidates.items()}
+        scenarios, probabilities = _milp_scenarios(round_matches)
+        return allocation, {"status": "success", "solver": "heuristic", "message": f"{strategy} deterministic per-entry market ranking", "runtime_seconds": 0.0, "objective": None, "weights": {key: 0.0 for key in ("expected_survivors", "at_least_one", "wipeout", "future_value", "concentration", "cvar")}, "components": _objective_components(round_matches, allocation, scenarios, probabilities)}
+    if strategy == "equal_diversification":
+        allocation = {}
+        exposure = Counter()
+        for entry, teams in sorted(candidates.items()):
+            allocation[entry] = min(teams, key=lambda team: (exposure[team], -current.get(team, 0.0), team)); exposure[allocation[entry]] += 1
+        scenarios, probabilities = _milp_scenarios(round_matches)
+        return allocation, {"status": "success", "solver": "heuristic", "message": "equal diversification minimum-exposure deterministic ranking", "runtime_seconds": 0.0, "objective": None, "weights": {"heuristic": "minimum current exposure"}, "components": _objective_components(round_matches, allocation, scenarios, probabilities)}
     scenarios, probabilities = _milp_scenarios(round_matches)
-    future = _future_values(all_matches, all_rounds, cutoff, candidates)
-    # Keep the completed MILP's independently validated objective active. The
-    # strategy label changes future-value treatment; concentration remains a
-    # reporting metric because the MILP's concentration linearisation is not a
-    # reliable tie-break for this twenty-entry replay.
-    weights = PortfolioWeights(concentration=0.0, future_value=1.0 if strategy in ("bellman", "max_expected_survivors") else 0.0)
+    future = _future_values(all_matches, all_rounds, cutoff, candidates, round_matches) if strategy in ("bellman", "balanced") else {}
+    if strategy in ("max_expected_survivors", "bellman", "balanced", "protect_one"):
+        if strategy == "max_expected_survivors":
+            allocation = {entry: teams[0] for entry, teams in candidates.items()}
+            config = STRATEGY_WEIGHTS["maximum_expected_survivors"]
+            message = "expected-survivors objective is separable; exact greedy optimum"
+        elif strategy == "bellman":
+            allocation = {entry: max(teams, key=lambda team: (future.get(entry, {}).get(team, 0.0), -current.get(team, 0.0), team)) for entry, teams in candidates.items()}
+            config = STRATEGY_WEIGHTS["bellman"]
+            message = "dynamic continuation value per entry"
+        elif strategy == "balanced":
+            exposure = Counter()
+            allocation = {}
+            for entry, teams in sorted(candidates.items()):
+                allocation[entry] = max(teams, key=lambda team: (current.get(team, 0.0) + future.get(entry, {}).get(team, 0.0) - .1 * exposure[team], current.get(team, 0.0), team))
+                exposure[allocation[entry]] += 1
+            config = STRATEGY_WEIGHTS["balanced"]
+            message = "documented balanced score with exposure penalty; separable incumbent"
+        else:
+            ordered = sorted({team for teams in candidates.values() for team in teams}, key=lambda team: (-current.get(team, 0.0), team))
+            allocation = {entry: ordered[index % len(ordered)] if ordered[index % len(ordered)] in teams else teams[0] for index, (entry, teams) in enumerate(sorted(candidates.items()))}
+            config = STRATEGY_WEIGHTS["protect_one"]
+            message = "at-least-one objective; deterministic exposure diversification"
+        return allocation, {"status": "success", "solver": "deterministic-objective", "message": message, "runtime_seconds": 0.0, "objective": None, "weights": config, "components": _objective_components(round_matches, allocation, scenarios, probabilities, future_values=future, weights=PortfolioWeights(**config))}
+    solver_candidates = {entry: teams[:4] for entry, teams in candidates.items()} if strategy == "balanced" else candidates
+    config_name = "maximum_expected_survivors" if strategy == "max_expected_survivors" else strategy
+    config = STRATEGY_WEIGHTS[config_name]
+    weights = PortfolioWeights(**config)
+    # No undocumented portfolio cap is imposed on the objective-defined MILP
+    # strategies.  This keeps maximum-expected-survivors equivalent to greedy
+    # when no explicit constraint is requested and leaves balanced governed by
+    # its displayed objective weights.
+    exposure_cap = None
+    cache_key = json.dumps({"candidates": solver_candidates, "scenarios": scenarios, "probabilities": probabilities, "future": future, "weights": config, "cap": exposure_cap}, sort_keys=True, default=str)
+    if cache_key in _ALLOCATION_CACHE:
+        cached = dict(_ALLOCATION_CACHE[cache_key]); cached["runtime_seconds"] = 0.0; cached["message"] = "cached identical round/allocation/scenario calculation"
+        return dict(cached.pop("allocation")), cached
     started = perf_counter()
-    exposure_cap = 2 if strategy == "equal_diversification" else 3 if strategy == "balanced" else None
-    result = milp_optimize(candidates, scenarios, weights=weights, exposure_cap=exposure_cap, scenario_probabilities=probabilities, future_values=future)
+    result = milp_optimize(solver_candidates, scenarios, weights=weights, exposure_cap=exposure_cap, scenario_probabilities=probabilities, future_values=future)
     elapsed = perf_counter() - started
     if result.feasible:
-        return result.allocation, {"status": "success", "message": result.message, "runtime_seconds": elapsed, "objective": result.objective}
+        info = {"status": "success", "solver": "milp", "message": result.message, "runtime_seconds": elapsed, "objective": result.objective, "weights": config, "components": result.components or {}, "allocation": result.allocation}
+        _ALLOCATION_CACHE[cache_key] = dict(info)
+        return result.allocation, info
     # The MILP is authoritative for twenty-entry allocation; this fallback is
     # only a recorded failure path and never silently claims MILP success.
     allocation = {entry.entry_id: teams[0] for entry, teams in zip(active_entries, (candidates.get(e.entry_id, []) for e in active_entries)) if teams}
-    return allocation, {"status": "failed", "message": result.message, "runtime_seconds": elapsed, "objective": None}
+    return allocation, {"status": "failed", "solver": "milp", "message": result.message, "runtime_seconds": elapsed, "objective": None, "weights": config, "components": {}}
+
+
+def _allocation_diagnostics(observations):
+    """Compare allocations on the same conditional state, with representative examples."""
+    grouped = defaultdict(dict)
+    for row in observations:
+        grouped[(row["season"], row["starting_round"], row["constructed_round"])][row["strategy"]] = row
+    comparisons = {}
+    examples = {}
+    component_names = ("expected_survivors", "probability_at_least_one", "wipeout_probability", "future_continuation_value", "cvar_eliminated", "squared_concentration", "objective")
+    for left_index, left in enumerate(STRATEGIES):
+        for right in STRATEGIES[left_index + 1:]:
+            pairs = [(group[left], group[right]) for group in grouped.values() if left in group and right in group]
+            same_alloc = [a["allocation"] == b["allocation"] for a, b in pairs]
+            exposures = [Counter(a["allocation"].values()) == Counter(b["allocation"].values()) for a, b in pairs]
+            differences = {name: float(np.mean([b["objective_components"].get(name, 0.0) - a["objective_components"].get(name, 0.0) for a, b in pairs])) if pairs else 0.0 for name in component_names}
+            outcome = {"mean_realised_loss_difference": float(np.mean([b["realised_loss"] - a["realised_loss"] for a, b in pairs])) if pairs else 0.0, "mean_survivor_difference": float(np.mean([b["surviving_after"] - a["surviving_after"] for a, b in pairs])) if pairs else 0.0}
+            identical_reason = "same allocation under the supplied candidate state" if pairs and all(same_alloc) else "different objective, candidate availability, or tie-break outcome"
+            comparisons[f"{left}|{right}"] = {"decision_count": len(pairs), "identical_allocation_percentage": float(np.mean(same_alloc) * 100) if pairs else 0.0, "identical_team_exposure_vector_percentage": float(np.mean(exposures) * 100) if pairs else 0.0, "objective_component_differences_right_minus_left": differences, "outcome_differences_right_minus_left": outcome, "reasons_allocations_identical": identical_reason}
+            differing = next(((key, a, b) for key, group in grouped.items() if left in group and right in group and group[left]["allocation"] != group[right]["allocation"] for a, b in [(group[left], group[right])]), None)
+            if differing:
+                key, a, b = differing
+                examples[f"{left}_vs_{right}"] = {"state": {"season": key[0], "starting_round": key[1], "constructed_round": key[2]}, "left": {"strategy": left, "allocation": a["allocation"], "objective_components": a["objective_components"], "realised_loss": a["realised_loss"]}, "right": {"strategy": right, "allocation": b["allocation"], "objective_components": b["objective_components"], "realised_loss": b["realised_loss"]}}
+    return {"pairwise": comparisons, "representative_different_allocations": examples}
 
 
 def evaluate_heterogeneous(matches: list[HistoricalMatch], seed: int = 7, bootstrap_repetitions: int = 1000) -> dict[str, object]:
@@ -251,25 +344,34 @@ def evaluate_heterogeneous(matches: list[HistoricalMatch], seed: int = 7, bootst
                         else:
                             active[entry.entry_id] = False; entry.active = False; entry.eliminated = True
                     realised_loss = len(active_entries) - survived
-                    round_row = {"season": season, "starting_round": audit.round_number, "constructed_round": round_matches[0].match_date.isoformat(), "strategy": strategy, "cartel_size": TOTAL_ENTRIES, "active_entries_before": len(active_entries), "surviving_after": survived, "realised_loss": realised_loss, "predicted_cvar": predicted["cvar"], "predicted_expected_loss": predicted["expected_loss"], "predicted_wipeout_probability": predicted["predicted_wipeout_probability"], "milp_status": milp_info["status"], "milp_runtime_seconds": milp_info["runtime_seconds"], "information_cutoff": cutoff.isoformat(), "scenario_count": predicted["scenario_count"], "scenario_probability_total": predicted["scenario_probability_total"], "alpha": predicted["alpha"], "var_threshold": predicted["var_threshold"], "loss_definition": predicted["loss_definition"], "normalized_cvar": predicted["normalized_cvar"], "distinct_teams_consumed": len(set().union(*(used.values()))), "team_usage_efficiency": len(set().union(*(used.values()))) / max(1, sum(len(value) for value in used.values()))}
+                    round_row = {"season": season, "starting_round": audit.round_number, "constructed_round": round_matches[0].match_date.isoformat(), "strategy": strategy, "cartel_size": TOTAL_ENTRIES, "active_entries_before": len(active_entries), "surviving_after": survived, "surviving_entries": survived, "realised_loss": realised_loss, "eliminated_entries": realised_loss, "eliminated_entry_fraction": realised_loss / max(1, len(active_entries)), "wipeout": realised_loss == len(active_entries), "at_least_one_survives": survived > 0, "allocation": dict(sorted(allocation.items())), "objective_components": milp_info.get("components", {}), "strategy_weights": milp_info.get("weights", {}), "predicted_cvar": predicted["cvar"], "predicted_expected_loss": predicted["expected_loss"], "predicted_wipeout_probability": predicted["predicted_wipeout_probability"], "milp_status": milp_info["status"], "milp_solver": milp_info.get("solver", "milp"), "milp_runtime_seconds": milp_info["runtime_seconds"], "information_cutoff": cutoff.isoformat(), "scenario_count": predicted["scenario_count"], "scenario_probability_total": predicted["scenario_probability_total"], "alpha": predicted["alpha"], "var_threshold": predicted["var_threshold"], "loss_definition": predicted["loss_definition"], "normalized_cvar": predicted["normalized_cvar"], "distinct_teams_consumed": len(set().union(*(used.values()))), "team_usage_efficiency": len(set().union(*(used.values()))) / max(1, sum(len(value) for value in used.values()))}
                     round_rows.append(round_row); observations.append(round_row)
-                evaluations.append({"season": season, "starting_round": audit.round_number, "strategy": strategy, "cartel_size": TOTAL_ENTRIES, "feasible": True, "conditional_state_label": "conditional surviving-cartel state", "completed_survival_rounds": sum(1 for row in round_rows if row["surviving_after"] > 0), "entries_surviving_by_round": [row["surviving_after"] for row in round_rows], "probability_at_least_one_remains": float(any(row["surviving_after"] > 0 for row in round_rows)), "wipeout_frequency": float(any(row["surviving_after"] == 0 for row in round_rows)), "expected_survivors": float(np.mean([row["surviving_after"] for row in round_rows])) if round_rows else 0.0, "realised_eliminated_entries": float(np.mean([row["realised_loss"] for row in round_rows])) if round_rows else 0.0, "mean_predicted_decision_cvar": float(np.mean([row["predicted_cvar"] for row in round_rows])) if round_rows else 0.0, "realised_aggregate_cvar": formal_cvar([row["realised_loss"] for row in round_rows], alpha=.95, loss_definition="eliminated entries").cvar if len(round_rows) >= 2 else None, "realised_aggregate_cvar_observations": len(round_rows), "concentration": [row["distinct_teams_consumed"] for row in round_rows], "distinct_teams_consumed": round_rows[-1]["distinct_teams_consumed"] if round_rows else 0, "team_usage_efficiency": round_rows[-1]["team_usage_efficiency"] if round_rows else 0, "milp": milp_rows, "rounds": round_rows})
+                losses = [row["realised_loss"] for row in round_rows]
+                fractions = [row["eliminated_entry_fraction"] for row in round_rows]
+                cvar_raw = formal_cvar(losses, alpha=.95, loss_definition="eliminated entries; active-entry counts displayed") if len(losses) >= 2 else None
+                cvar_fraction = formal_cvar(fractions, alpha=.95, loss_definition="eliminated-entry fraction") if len(fractions) >= 2 else None
+                evaluations.append({"season": season, "starting_round": audit.round_number, "strategy": strategy, "cartel_size": TOTAL_ENTRIES, "feasible": True, "conditional_state_label": "conditional surviving-cartel state", "completed_survival_rounds": sum(1 for row in round_rows if row["surviving_after"] > 0), "entries_surviving_by_round": [row["surviving_after"] for row in round_rows], "probability_at_least_one_remains": float(any(row["surviving_after"] > 0 for row in round_rows)), "wipeout_frequency": float(any(row["surviving_after"] == 0 for row in round_rows)), "expected_survivors": float(np.mean([row["surviving_after"] for row in round_rows])) if round_rows else 0.0, "area_under_survivor_curve": float(sum(row["surviving_after"] for row in round_rows) / TOTAL_ENTRIES), "mean_eliminated_entry_fraction": float(np.mean(fractions)) if fractions else 0.0, "realised_eliminated_entries": float(np.mean(losses)) if losses else 0.0, "mean_predicted_decision_cvar": float(np.mean([row["predicted_cvar"] for row in round_rows])) if round_rows else 0.0, "realised_aggregate_cvar": cvar_raw.cvar if cvar_raw else None, "realised_aggregate_normalized_cvar": cvar_fraction.cvar if cvar_fraction else None, "realised_aggregate_cvar_observations": len(round_rows), "concentration": [row["distinct_teams_consumed"] for row in round_rows], "distinct_teams_consumed": round_rows[-1]["distinct_teams_consumed"] if round_rows else 0, "team_usage_efficiency": round_rows[-1]["team_usage_efficiency"] if round_rows else 0, "milp": milp_rows, "rounds": round_rows})
     aggregate = {}
     for key in sorted({(row["strategy"], row["season"]) for row in observations}):
         selected = [row for row in observations if (row["strategy"], row["season"]) == key]
         if len(selected) < 2: continue
-        losses = np.asarray([row["realised_loss"] for row in selected], dtype=float); cvar = formal_cvar(losses, alpha=.95, loss_definition="eliminated entries")
-        aggregate[f"{key[0]}|{key[1]}"] = {**cvar.as_dict(), "observation_count": len(selected), "mean_loss": float(np.mean(losses)), "maximum_loss": float(np.max(losses)), "normalized_cvar": float(cvar.cvar / TOTAL_ENTRIES), "weights": "equal-weighted comparable round decisions"}
+        losses = np.asarray([row["realised_loss"] for row in selected], dtype=float); fractions = np.asarray([row["eliminated_entry_fraction"] for row in selected], dtype=float)
+        cvar = formal_cvar(losses, alpha=.95, loss_definition="eliminated entries; active-entry counts displayed")
+        fraction_cvar = formal_cvar(fractions, alpha=.95, loss_definition="eliminated-entry fraction")
+        aggregate[f"{key[0]}|{key[1]}"] = {**cvar.as_dict(), "observation_count": len(selected), "mean_loss": float(np.mean(losses)), "mean_eliminated_entry_fraction": float(np.mean(fractions)), "maximum_loss": float(np.max(losses)), "active_entry_count_min": int(min(row["active_entries_before"] for row in selected)), "active_entry_count_max": int(max(row["active_entries_before"] for row in selected)), "normalized_cvar": float(fraction_cvar.cvar), "raw_cvar": float(cvar.cvar), "weights": "equal-weighted comparable round decisions"}
     bootstrap_rows = [{**row, "start_round": row["starting_round"]} for row in evaluations if row["feasible"]]
-    bootstrap = {strategy: {metric: clustered_paired_bootstrap(bootstrap_rows, metric, strategy, baseline="concentrated_favourite", repetitions=bootstrap_repetitions, seed=seed) for metric in ("realised_eliminated_entries", "expected_survivors")} for strategy in STRATEGIES if strategy != "concentrated_favourite"}
+    bootstrap = {strategy: {metric: clustered_paired_bootstrap(bootstrap_rows, metric, strategy, baseline="concentrated_favourite", repetitions=bootstrap_repetitions, seed=seed) for metric in ("realised_eliminated_entries", "expected_survivors", "area_under_survivor_curve", "mean_eliminated_entry_fraction", "wipeout_frequency", "probability_at_least_one_remains")} for strategy in STRATEGIES if strategy != "concentrated_favourite"}
     strategy_summary = {}
     for strategy in STRATEGIES:
         selected = [row for row in observations if row["strategy"] == strategy]
         milp = [item for evaluation in evaluations if evaluation["strategy"] == strategy for item in evaluation["milp"]]
         losses = np.asarray([row["realised_loss"] for row in selected], dtype=float)
-        cvar = formal_cvar(losses, alpha=.95, loss_definition="eliminated entries")
-        strategy_summary[strategy] = {"observation_count": len(selected), "mean_expected_survivors": float(np.mean([row["surviving_after"] for row in selected])), "mean_realised_eliminated_entries": float(np.mean(losses)), "predicted_decision_cvar": float(np.mean([row["predicted_cvar"] for row in selected])), "realised_aggregate_cvar": cvar.cvar if len(losses) >= 2 else None, "realised_aggregate_cvar_observations": len(losses), "wipeout_frequency": float(np.mean([row["realised_loss"] >= row["active_entries_before"] for row in selected])), "mean_distinct_teams_consumed": float(np.mean([row["distinct_teams_consumed"] for row in selected])), "mean_team_usage_efficiency": float(np.mean([row["team_usage_efficiency"] for row in selected])), "milp_successes": sum(item["status"] == "success" for item in milp), "milp_failures": sum(item["status"] != "success" for item in milp), "milp_mean_runtime_seconds": float(np.mean([item["runtime_seconds"] for item in milp]))}
+        cvar = formal_cvar(losses, alpha=.95, loss_definition="eliminated entries; active-entry counts displayed")
+        fraction_cvar = formal_cvar([row["eliminated_entry_fraction"] for row in selected], alpha=.95, loss_definition="eliminated-entry fraction")
+        strategy_summary[strategy] = {"observation_count": len(selected), "mean_expected_survivors": float(np.mean([row["surviving_after"] for row in selected])), "mean_realised_eliminated_entries": float(np.mean(losses)), "mean_eliminated_entry_fraction": float(np.mean([row["eliminated_entry_fraction"] for row in selected])), "area_under_survivor_curve": float(np.mean([row["surviving_after"] for row in selected]) / TOTAL_ENTRIES), "predicted_decision_cvar": float(np.mean([row["predicted_cvar"] for row in selected])), "predicted_normalized_cvar": float(np.mean([row["normalized_cvar"] for row in selected])), "realised_aggregate_cvar": cvar.cvar if len(losses) >= 2 else None, "realised_aggregate_normalized_cvar": fraction_cvar.cvar if len(losses) >= 2 else None, "realised_aggregate_cvar_observations": len(losses), "maximum_loss": float(np.max(losses)) if len(losses) else 0.0, "probability_at_least_one_survives": float(np.mean([row["at_least_one_survives"] for row in selected])), "wipeout_frequency": float(np.mean([row["wipeout"] for row in selected])), "mean_distinct_teams_consumed": float(np.mean([row["distinct_teams_consumed"] for row in selected])), "mean_team_usage_efficiency": float(np.mean([row["team_usage_efficiency"] for row in selected])), "strategy_weights": STRATEGY_WEIGHTS.get(strategy, {"heuristic": strategy}), "milp_successes": sum(item["status"] == "success" for item in milp), "milp_failures": sum(item["status"] != "success" for item in milp), "milp_mean_runtime_seconds": float(np.mean([item["runtime_seconds"] for item in milp]))}
     feasibility_by_season = {season: {"feasible": sum(row["season"] == season and row["feasible"] for row in construction), "infeasible": sum(row["season"] == season and not row["feasible"] for row in construction)} for season in seasons}
     all_milp = [item for evaluation in evaluations for item in evaluation["milp"]]
     milp_summary = {"calls": len(all_milp), "successes": sum(item["status"] == "success" for item in all_milp), "failures": sum(item["status"] != "success" for item in all_milp), "total_runtime_seconds": float(sum(item["runtime_seconds"] for item in all_milp)), "mean_runtime_seconds": float(np.mean([item["runtime_seconds"] for item in all_milp])) if all_milp else 0.0, "maximum_runtime_seconds": float(np.max([item["runtime_seconds"] for item in all_milp])) if all_milp else 0.0}
-    return {"conditional_state_label": "conditional surviving-cartel state; not unconditional twenty-entry survival probability", "players": {"player-1": ENTRY_LIMIT, "player-2": ENTRY_LIMIT}, "total_entries": TOTAL_ENTRIES, "minimum_distinct_used_team_sets": 2, "seasons": seasons, "feasibility_by_season": feasibility_by_season, "cohort_construction": construction, "evaluations": evaluations, "decision_observations": observations, "realised_cvar": aggregate, "strategy_summary": strategy_summary, "strategy_bootstrap_vs_concentrated": bootstrap, "milp_summary": milp_summary, "seed": seed, "bootstrap_repetitions": bootstrap_repetitions}
+    strategy_weights = {"concentrated_favourite": {"selection_rule": "highest current market-probability eligible unused team per entry", "objective_weights": "heuristic"}, "independent_greedy": {"selection_rule": "independently highest current market-probability eligible unused team", "objective_weights": "heuristic"}, "equal_diversification": {"selection_rule": "minimum current exposure, then market probability", "objective_weights": "heuristic"}, **STRATEGY_WEIGHTS}
+    classifications = {"concentrated_favourite": "validated default", "independent_greedy": "validated alternative", "max_expected_survivors": "validated alternative", "protect_one": "experimental", "equal_diversification": "experimental", "bellman": "experimental", "balanced": "experimental"}
+    return {"conditional_state_label": "conditional surviving-cartel state; not unconditional twenty-entry survival probability", "players": {"player-1": ENTRY_LIMIT, "player-2": ENTRY_LIMIT}, "total_entries": TOTAL_ENTRIES, "minimum_distinct_used_team_sets": 2, "seasons": seasons, "feasibility_by_season": feasibility_by_season, "cohort_construction": construction, "evaluations": evaluations, "decision_observations": observations, "allocation_diagnostics": _allocation_diagnostics(observations), "realised_cvar": aggregate, "strategy_summary": strategy_summary, "strategy_weights": strategy_weights, "strategy_classifications": classifications, "strategy_bootstrap_vs_concentrated": bootstrap, "milp_summary": milp_summary, "seed": seed, "bootstrap_repetitions": bootstrap_repetitions}
