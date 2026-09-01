@@ -2,13 +2,11 @@
 from dataclasses import dataclass
 from itertools import product
 import numpy as np
+from .cvar import formal_cvar as _formal_cvar
 
 def formal_cvar(losses: np.ndarray, alpha: float = .95) -> float:
-    """Empirical Rockafellar-Uryasev CVaR: min_eta eta+E[(L-eta)+]/(1-alpha)."""
-    if not 0 <= alpha < 1: raise ValueError("alpha must be in [0, 1)")
-    values = np.asarray(losses, dtype=float)
-    if values.size == 0: return 0.0
-    return float(min(eta + np.maximum(values - eta, 0).mean() / (1-alpha) for eta in np.unique(values)))
+    """Deprecated scalar compatibility wrapper; use ``cvar.formal_cvar`` for details."""
+    return _formal_cvar(losses, alpha=alpha).cvar
 
 def exact_current_round(allocation: dict[str, str], fixture_probabilities: dict[str, np.ndarray], fixture_teams: dict[str, tuple[str, str]], alpha: float = .95) -> dict[str, object]:
     """Enumerate mutually-exclusive H/D/A outcomes for a practical current round."""
@@ -28,7 +26,8 @@ def exact_current_round(allocation: dict[str, str], fixture_probabilities: dict[
     counts = np.array(sorted(distribution), dtype=int); probabilities = np.array([distribution[c] for c in counts])
     expected = float(np.sum(counts * probabilities)); any_survive = float(np.sum(probabilities[counts > 0])); wipeout = float(distribution.get(0, 0.0))
     losses = len(allocation) - counts
-    return {"survivor_counts": counts, "probabilities": probabilities, "expected_survivors": expected, "probability_at_least_one": any_survive, "wipeout_probability": wipeout, "cvar_eliminated": formal_cvar(np.repeat(losses, np.maximum(1, np.rint(probabilities*100000).astype(int))), alpha)}
+    cvar = _formal_cvar(losses, probabilities, alpha, "eliminated entries")
+    return {"survivor_counts": counts, "probabilities": probabilities, "expected_survivors": expected, "probability_at_least_one": any_survive, "wipeout_probability": wipeout, "cvar_eliminated": cvar.cvar, "cvar": cvar.as_dict()}
 
 @dataclass
 class AdaptiveSimulationSummary:
