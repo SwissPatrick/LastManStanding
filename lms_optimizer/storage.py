@@ -9,7 +9,7 @@ from .models import Entry, FamilyMember, Fixture, OddsQuote, Player, Round, Seas
 T = TypeVar("T")
 
 class Repository:
-    TABLES = ("seasons", "rounds", "fixtures", "odds_quotes", "players", "family_members", "entries", "selections", "wider_field", "raw_imports", "audit_log")
+    TABLES = ("seasons", "rounds", "fixtures", "odds_quotes", "players", "family_members", "entries", "selections", "wider_field", "raw_imports", "audit_log", "competition_entries", "competition_picks", "competition_imports")
 
     def __init__(self, path: str | Path = "data/lms.sqlite3") -> None:
         self.path = Path(path)
@@ -29,6 +29,18 @@ class Repository:
             CREATE TABLE IF NOT EXISTS wider_field (season TEXT NOT NULL, round_number INTEGER NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(season, round_number));
             CREATE TABLE IF NOT EXISTS raw_imports (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, collected_at TEXT NOT NULL, payload TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, event TEXT NOT NULL, created_at TEXT NOT NULL, payload TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS competition_entries (
+                season TEXT NOT NULL, label_normalised TEXT NOT NULL, display_label TEXT NOT NULL,
+                active INTEGER NOT NULL, family_entry_id TEXT, eliminated_round INTEGER, eliminated_at TEXT,
+                payload TEXT NOT NULL, PRIMARY KEY(season, label_normalised));
+            CREATE TABLE IF NOT EXISTS competition_picks (
+                season TEXT NOT NULL, label_normalised TEXT NOT NULL, round_number INTEGER NOT NULL,
+                team TEXT NOT NULL, payload TEXT NOT NULL,
+                PRIMARY KEY(season, label_normalised, round_number));
+            CREATE TABLE IF NOT EXISTS competition_imports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, checksum TEXT NOT NULL, season TEXT NOT NULL,
+                reporting_round INTEGER NOT NULL, applied_at TEXT NOT NULL, payload TEXT NOT NULL,
+                UNIQUE(checksum, season, reporting_round));
         """)
         self.connection.commit()
         # A non-destructive migration: old players remain untouched and are
@@ -93,6 +105,55 @@ class Repository:
         if table not in self.TABLES:
             raise ValueError("unknown table")
         return int(self.connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+
+    def audit_revision(self) -> int:
+        return int(self.connection.execute("SELECT COALESCE(MAX(id), 0) FROM audit_log").fetchone()[0])
+
+    def competition_entries(self, season: str) -> list[dict[str, object]]:
+        return [json.loads(row["payload"]) for row in self.connection.execute(
+            "SELECT payload FROM competition_entries WHERE season = ? ORDER BY display_label COLLATE NOCASE", (season,)
+        )]
+
+    def competition_picks(self, season: str) -> list[dict[str, object]]:
+        return [json.loads(row["payload"]) for row in self.connection.execute(
+            "SELECT payload FROM competition_picks WHERE season = ? ORDER BY label_normalised, round_number", (season,)
+        )]
+
+    def latest_competition_import_round(self, season: str) -> int | None:
+        value = self.connection.execute("SELECT MAX(reporting_round) FROM competition_imports WHERE season = ?", (season,)).fetchone()[0]
+        return int(value) if value is not None else None
+
+    def apply_competition_import(self, plan: dict[str, object]) -> None:
+        """Apply all field changes and audit records in one SQLite transaction."""
+        now = str(plan["uploaded_at"])
+        with self.connection:
+            for entry in plan["entries"]:
+                self.connection.execute(
+                    "INSERT OR REPLACE INTO competition_entries(season,label_normalised,display_label,active,family_entry_id,eliminated_round,eliminated_at,payload) VALUES(?,?,?,?,?,?,?,?)",
+                    (entry["season"], entry["normalised_label"], entry["display_label"], int(entry["active"]), entry.get("family_entry_id"), entry.get("eliminated_round"), entry.get("eliminated_at"), json.dumps(entry)),
+                )
+            for pick in plan["picks"]:
+                self.connection.execute(
+                    "INSERT OR IGNORE INTO competition_picks(season,label_normalised,round_number,team,payload) VALUES(?,?,?,?,?)",
+                    (pick["season"], pick["normalised_label"], pick["round_number"], pick["team"], json.dumps(pick)),
+                )
+            for selection in plan["family_selections"]:
+                self.connection.execute(
+                    "INSERT OR IGNORE INTO selections(entry_id,round_number,team,is_backup,payload) VALUES(?,?,?,?,?)",
+                    (selection["entry_id"], selection["round_number"], selection["team"], 0, json.dumps(selection)),
+                )
+            for entry_id in plan["eliminated_family_entry_ids"]:
+                row = self.connection.execute("SELECT payload FROM entries WHERE entry_id = ?", (entry_id,)).fetchone()
+                if row:
+                    payload = json.loads(row[0]); payload["active"] = False
+                    self.connection.execute("UPDATE entries SET payload = ? WHERE entry_id = ?", (json.dumps(payload), entry_id))
+            snapshot = plan.get("wider_field")
+            if snapshot:
+                self.connection.execute("INSERT OR REPLACE INTO wider_field(season,round_number,payload) VALUES(?,?,?)", (snapshot["season"], snapshot["round_number"], json.dumps(snapshot)))
+            payload = dict(plan["import_record"])
+            self.connection.execute("INSERT OR IGNORE INTO competition_imports(checksum,season,reporting_round,applied_at,payload) VALUES(?,?,?,?,?)", (payload["checksum"], payload["season"], payload["reporting_round"], now, json.dumps(payload)))
+            self.connection.execute("INSERT INTO raw_imports(kind,collected_at,payload) VALUES(?,?,?)", ("competition_csv", now, json.dumps(payload)))
+            self.connection.execute("INSERT INTO audit_log(event,created_at,payload) VALUES(?,?,?)", ("competition_csv_imported", now, json.dumps(payload)))
 
     def close(self) -> None:
         self.connection.close()

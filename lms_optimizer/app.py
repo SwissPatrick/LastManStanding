@@ -24,6 +24,8 @@ def _state(st, service):
     st.session_state.setdefault("page", "Home")
     st.session_state.setdefault("advanced", False)
     st.session_state.setdefault("analysis", None)
+    st.session_state.setdefault("competition_import_preview", None)
+    st.session_state.setdefault("competition_import_raw", None)
     existing_locked = st.session_state.get("locked")
     st.session_state.setdefault("snapshot", None)
     entries = service.entries()
@@ -115,6 +117,92 @@ def _home(st, service):
     else: message, action, page = "This round has no matches yet.", "Get this week's matches", "Get"
     st.info(message)
     if st.button(action, type="primary", key="home_primary"): st.session_state.page = page; st.rerun()
+    if st.button("Import competition CSV", key="home_import_competition", icon=":material/upload_file:"):
+        st.session_state.page = "Import competition CSV"; st.rerun()
+
+
+def _competition_import(st, service):
+    """A deliberately linear, review-before-write organiser-list workflow."""
+    from .competition_import import csv_template
+    st.title("Import competition CSV")
+    st.caption("Upload an organiser survivor list. It records historical picks without requiring fixtures, odds, or deadline checks.")
+    st.download_button("Download fictional CSV template", data=csv_template(), file_name="competition-import-template.csv", mime="text/csv", icon=":material/download:")
+    season_default = st.session_state.get("season") or "2026/27"
+    with st.form("competition_csv_upload", border=True):
+        uploaded = st.file_uploader("CSV file", type=["csv"], key="competition_csv_file")
+        season = st.text_input("Season", value=season_default, key="competition_csv_season")
+        reporting_round = int(st.number_input("Reporting round", min_value=1, value=int(st.session_state.get("round_number", 1)), key="competition_csv_round"))
+        complete = st.checkbox("This is the complete list of surviving entries as of this upload", value=False, key="competition_csv_complete")
+        review = st.form_submit_button("Review entries and family links", type="primary", icon=":material/fact_check:")
+    if review:
+        if uploaded is None:
+            st.error("Choose a CSV file first.")
+        else:
+            raw = uploaded.getvalue()
+            preview = service.competition_import_preview(raw, season.strip(), reporting_round, complete)
+            st.session_state.competition_import_raw = raw
+            st.session_state.competition_import_preview = preview
+    preview = st.session_state.get("competition_import_preview")
+    raw = st.session_state.get("competition_import_raw")
+    if not preview or not raw:
+        return
+    if preview["season"] != season or preview["reporting_round"] != reporting_round or preview["complete_list"] != complete:
+        st.info("Change season, round, or list type and review again to refresh the preview.")
+        return
+    issues = preview["issues"]
+    for issue in issues:
+        location = "" if issue.get("row") is None else f" Row {issue['row']}{', ' + issue['column'] if issue.get('column') else ''}."
+        (st.error if issue["severity"] == "error" else st.warning)(issue["message"] + location)
+    st.subheader("Review entries and family links")
+    members = {member.member_id: member.name for member in service.family_members()}
+    entries = [entry for entry in service.entries() if entry.season == preview["season"]]
+    options = [""] + [entry.entry_id for entry in entries]
+    names = {"": "Outside entry (not part of our family)"}
+    for index, entry in enumerate(entries, 1):
+        names[entry.entry_id] = f"{members.get(service.entry_owner(entry), 'Family member')} — Entry {index}"
+    current_links = dict(preview.get("family_links", {}))
+    with st.form("competition_csv_links", border=True):
+        st.caption("Link rows only when you know which existing family entry they represent. Links persist; outside entries remain separate.")
+        for row in service.competition_import_preview(raw, preview["season"], preview["reporting_round"], preview["complete_list"], current_links).get("_plan", {}).get("entries", []):
+            label = str(row["display_label"]); normalised = str(row["normalised_label"])
+            locked = row.get("family_entry_id")
+            selected = str(locked or current_links.get(normalised, ""))
+            if selected not in options: selected = ""
+            st.selectbox(label, options, index=options.index(selected), format_func=lambda value: names[value], disabled=bool(locked), key=f"competition_link_{normalised}")
+        make_preview = st.form_submit_button("Preview changes", type="primary", icon=":material/preview:")
+    if make_preview:
+        links = {}
+        for key, value in st.session_state.items():
+            if key.startswith("competition_link_") and value:
+                links[key.removeprefix("competition_link_")] = value
+        st.session_state.competition_import_preview = service.competition_import_preview(raw, preview["season"], preview["reporting_round"], preview["complete_list"], links)
+        st.rerun()
+    preview = st.session_state.competition_import_preview
+    summary = preview["summary"]
+    st.subheader("Preview changes")
+    st.dataframe([{
+        "Entries in this file": summary["entries_in_file"], "Family entries matched": summary["family_entries_matched"],
+        "Outside entries": summary["outside_entries"], "New picks": summary["new_picks"], "Unchanged picks": summary["unchanged_picks"],
+        "Proposed eliminations": len(summary["proposed_eliminations"]),
+    }], hide_index=True)
+    st.write(f"If confirmed complete: **{summary['total_competition_entries_alive']} total alive = {summary['family_entries_alive']} family + {summary['outside_entries_alive']} outside**.")
+    if summary["proposed_eliminations"]:
+        st.warning("Proposed eliminations: " + ", ".join(summary["proposed_eliminations"]))
+    if summary["unlinked_family_entry_ids"]:
+        st.warning("Unlinked active family entries: " + ", ".join(names.get(entry_id, entry_id) for entry_id in summary["unlinked_family_entry_ids"]))
+    if preview["already_applied"]:
+        st.success("This exact file was already imported for this season and round. Reimporting is safe and will not duplicate records.")
+    confirm_eliminations = st.checkbox("I confirm these missing entries are eliminated from the complete organiser list", disabled=not bool(summary["proposed_eliminations"]), key="competition_confirm_eliminations")
+    if st.button("Confirm import", type="primary", disabled=bool(preview["has_errors"]), icon=":material/check_circle:"):
+        try:
+            outcome = service.apply_competition_import(raw, preview, confirm_eliminations)
+            if not st.session_state.get("locked"):
+                st.session_state.analysis = None
+                st.session_state.snapshot = None
+            st.success("Competition CSV imported." if not outcome["already_applied"] else "No changes made; this file was already imported.")
+            st.write(f"Alive entries: {outcome['summary']['total_competition_entries_alive']} total, {outcome['summary']['family_entries_alive']} family, {outcome['summary']['outside_entries_alive']} outside.")
+        except Exception as exc:
+            st.error(str(exc))
 
 
 def _get(st, service):
@@ -291,16 +379,19 @@ def run() -> None:
     with st.sidebar:
         st.title("LMS")
         for page in ("Home", "Entries", "History", "Settings"):
-            if st.button(page, use_container_width=True, key=f"nav_{page}"): st.session_state.page = page; st.rerun()
+            if st.button(page, width="stretch", key=f"nav_{page}"): st.session_state.page = page; st.rerun()
     page = st.session_state.get("page", "Home")
     if page == "Home": _home(st, service)
     elif page == "Get": _get(st, service)
     elif page == "Choose": _choose(st, service)
     elif page in ("Confirm", "Share"): _confirm(st, service)
     elif page == "Results": _results(st, service)
+    elif page == "Import competition CSV": _competition_import(st, service)
     elif page == "Settings": _settings(st, service)
     elif page == "Entries":
         st.title("Entries")
+        if st.button("Import competition CSV", type="primary", icon=":material/upload_file:"):
+            st.session_state.page = "Import competition CSV"; st.rerun()
         members = {x.member_id: x.name for x in service.family_members()}
         for index, e in enumerate(service.entries(), 1): st.write(f"{members.get(service.entry_owner(e), 'Family member')} — Entry {index} · {'active' if e.active else 'eliminated'}")
         st.subheader("Add a player")

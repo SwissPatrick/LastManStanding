@@ -39,5 +39,6 @@ data/provider_cache/
 data/benchmarks/
 data/forecasts/
 data/recommendations/
+data/competition_imports/
 *.tmp
 *.log

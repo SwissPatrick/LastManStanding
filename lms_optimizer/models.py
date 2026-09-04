@@ -94,7 +94,9 @@ class WiderFieldSnapshot(BaseModel):
     """Manual, round-stamped information about the private wider competition."""
     season: str = Field(pattern=r"^\d{4}/\d{2}$")
     round_number: int = Field(ge=1)
-    starting_entries: int = Field(ge=0)
+    # An organiser list first seen mid-season tells us the observed survivors,
+    # not the original paid field.  ``None`` deliberately means unknown.
+    starting_entries: Optional[int] = Field(default=None, ge=0)
     surviving_entries: int = Field(ge=0)
     known_selections: Optional[dict[str, int]] = None
     recorded_at: datetime
@@ -102,7 +104,7 @@ class WiderFieldSnapshot(BaseModel):
     @field_validator("surviving_entries")
     @classmethod
     def survivors_cannot_exceed_start(cls, value, info):
-        if "starting_entries" in info.data and value > info.data["starting_entries"]:
+        if info.data.get("starting_entries") is not None and value > info.data["starting_entries"]:
             raise ValueError("surviving entries cannot exceed starting entries")
         return value
 

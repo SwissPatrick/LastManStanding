@@ -47,3 +47,15 @@ def test_normal_mode_does_not_show_technical_controls(tmp_path, monkeypatch):
     assert not app.exception
     widgets = list(app.text_input) + list(app.number_input)
     assert not any(item.label in {"CSV import", "Process workers", "Performance profile", "Fixture ID"} for item in widgets)
+
+
+def test_import_competition_csv_is_available_from_home_and_entries(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("LMS_DATABASE_PATH", str(tmp_path / "data" / "lms.sqlite3"))
+    app = AppTest.from_file(APP).run()
+    button(app, "Finish setup").click().run()
+    button(app, "Import competition CSV").click().run()
+    assert not app.exception
+    assert app.title[0].value == "Import competition CSV"
+    button(app, "Entries").click().run()
+    assert button(app, "Import competition CSV")

@@ -2,10 +2,13 @@
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
+import hashlib
 from .models import Entry, FamilyMember, Fixture, FixtureStatus, OddsQuote, Player, Round, Season, WiderFieldSnapshot
 from .probability import additive, market_disagreement, proportional, power_method, shin
 from .rules import eligible_fixtures, round_is_open, validate_selection
 from .storage import Repository
+from .competition_import import parse_competition_csv, normalise_label, suspected_rename
 from .simulation import exact_current_round, exact_cartel_summary, adaptive_multi_round_simulation
 from .forecast_snapshot import ForecastSnapshot, ForecastStore
 from .providers import Provider, ProviderEvent, ProviderError, normalise_team
@@ -202,16 +205,19 @@ class LMSWorkflow:
         return [OddsQuote.model_validate(x) for x in self.repo.list_payloads("odds_quotes")]
 
     def available_teams(self, entry_id: str, round_number: int) -> list[str]:
-        used = {x["team"] for x in self.repo.list_payloads("selections") if x["entry_id"] == entry_id}
+        # A primary in the current round is a recorded choice, not historical
+        # consumption. Backups never consume a team.
+        used = {x["team"] for x in self.repo.list_payloads("selections") if x["entry_id"] == entry_id and not x.get("is_backup", False) and int(x["round_number"]) < round_number}
         return sorted({t for f in eligible_fixtures(self.fixtures(), round_number) for t in (f.home_team, f.away_team) if t not in used})
 
     def used_teams(self, entry_id: str) -> list[str]:
-        return sorted({x["team"] for x in self.repo.list_payloads("selections") if x["entry_id"] == entry_id})
+        # Backups are only contingency information; they never consume a team.
+        return sorted({x["team"] for x in self.repo.list_payloads("selections") if x["entry_id"] == entry_id and not x.get("is_backup", False)})
 
     def record_selection(self, entry_id: str, round_number: int, team: str, is_backup: bool = False, selected_at: datetime | None = None) -> None:
         selected_at = selected_at or datetime.now(timezone.utc)
         from .models import Selection
-        previous = [Selection.model_validate(x) for x in self.repo.list_payloads("selections")]
+        previous = [Selection.model_validate(x) for x in self.repo.list_payloads("selections") if not x.get("is_backup", False)]
         round_rows = [Round.model_validate(x) for x in self.repo.list_payloads("rounds") if x["round_number"] == round_number]
         deadline = round_rows[-1].selection_deadline if round_rows else None
         decision = validate_selection(Selection(entry_id=entry_id, round_number=round_number, team=team, selected_at=selected_at), self.fixtures(), previous, now=selected_at, deadline=deadline)
@@ -317,7 +323,12 @@ class LMSWorkflow:
         probabilities = self.team_probabilities(round_number)
         scored = {row.team: row.proportional for row in probabilities}
         allocation, backups = {}, {}
+        recorded = {(str(row["entry_id"]), int(row["round_number"])): str(row["team"]) for row in self.repo.list_payloads("selections") if not row.get("is_backup", False)}
         for entry in entries:
+            if (entry.entry_id, round_number) in recorded:
+                allocation[entry.entry_id] = recorded[(entry.entry_id, round_number)]
+                backups[entry.entry_id] = None
+                continue
             teams = sorted(self.available_teams(entry.entry_id, round_number), key=lambda team: (-scored.get(team, 0.0), team))
             allocation[entry.entry_id] = teams[0]; backups[entry.entry_id] = teams[1] if len(teams) > 1 else None
         fixture_probabilities, fixture_teams = self.simulation_inputs(round_number)
@@ -372,3 +383,126 @@ class LMSWorkflow:
                         self.repo.save_entry(entry.model_copy(update={"active": False}))
         self.repo.audit("results_finalised", {"fixture_id": fixture_id, "survival": survival})
         return survival
+
+    # Competition CSV imports are intentionally separate from record_selection:
+    # an organiser's historical list is evidence, not an app submission made
+    # before a fixture deadline.
+    def competition_import_preview(
+        self, raw: bytes, season: str, reporting_round: int, complete_list: bool,
+        family_links: dict[str, str] | None = None,
+    ) -> dict[str, object]:
+        parsed = parse_competition_csv(raw, reporting_round)
+        issues = [{"severity": x.severity, "message": x.message, "row": x.row, "column": x.column} for x in parsed.issues]
+        family_links = {normalise_label(label): entry_id for label, entry_id in (family_links or {}).items() if entry_id}
+        entries_by_id = {entry.entry_id: entry for entry in self.entries() if entry.season == season}
+        existing = {str(row["normalised_label"]): row for row in self.repo.competition_entries(season)}
+        existing_picks = {(str(row["normalised_label"]), int(row["round_number"])): str(row["team"]) for row in self.repo.competition_picks(season)}
+        primary = {(str(row["entry_id"]), int(row["round_number"])): str(row["team"]) for row in self.repo.list_payloads("selections") if not row.get("is_backup", False)}
+        latest_round = self.repo.latest_competition_import_round(season)
+        import_rows = self.repo.list_payloads("competition_imports")
+        already_applied = any(row.get("season") == season and row.get("checksum") == parsed.checksum and int(row.get("reporting_round", 0)) == reporting_round for row in import_rows)
+        if latest_round is not None and reporting_round < latest_round and not already_applied:
+            issues.append({"severity": "error", "message": f"Round {reporting_round} is older than the latest imported Round {latest_round}. Create a correction workflow instead of overwriting newer information.", "row": None, "column": None})
+        if not already_applied and latest_round is not None and reporting_round == latest_round:
+            issues.append({"severity": "warning", "message": "This is another observation for the same reporting round; only compatible additions can be applied.", "row": None, "column": None})
+        link_owner: dict[str, str] = {}
+        for label, entry_id in family_links.items():
+            if entry_id not in entries_by_id:
+                issues.append({"severity": "error", "message": "A selected family entry does not belong to this season.", "row": None, "column": None}); continue
+            if entry_id in link_owner.values():
+                issues.append({"severity": "error", "message": "One family entry cannot link to multiple competition rows.", "row": None, "column": None})
+            link_owner[label] = entry_id
+        entries_plan: list[dict[str, object]] = []
+        picks_plan: list[dict[str, object]] = []
+        family_selections: list[dict[str, object]] = []
+        new_picks = unchanged_picks = 0
+        seen = set()
+        for row in parsed.rows:
+            seen.add(row.normalised_label)
+            prior = existing.get(row.normalised_label)
+            if not prior:
+                similar = suspected_rename(row.normalised_label, list(existing))
+                if similar:
+                    issues.append({"severity": "warning", "message": f"Possible rename of '{existing[similar]['display_label']}'. It will remain a separate entry until you correct or review the label.", "row": row.row_number, "column": "Entry"})
+            persisted_link = str(prior.get("family_entry_id")) if prior and prior.get("family_entry_id") else None
+            selected_link = link_owner.get(row.normalised_label)
+            if persisted_link and selected_link and persisted_link != selected_link:
+                issues.append({"severity": "error", "message": f"{row.label} is already linked to another family entry and cannot be reassigned silently.", "row": row.row_number, "column": "Entry"})
+            family_entry_id = persisted_link or selected_link
+            if prior and not bool(prior.get("active", True)):
+                issues.append({"severity": "error", "message": f"{row.label} was previously eliminated and cannot be reactivated by an upload.", "row": row.row_number, "column": "Entry"})
+            display_label = str(prior.get("display_label")) if prior else row.label
+            entries_plan.append({"season": season, "normalised_label": row.normalised_label, "display_label": display_label, "active": True, "family_entry_id": family_entry_id, "eliminated_round": None, "eliminated_at": None, "source": "competition_csv"})
+            combined = {rnd: team for (label, rnd), team in existing_picks.items() if label == row.normalised_label}
+            for number, team in row.picks.items():
+                old = existing_picks.get((row.normalised_label, number))
+                if old and old != team:
+                    issues.append({"severity": "error", "message": f"Conflicts with the already recorded Round {number} pick ({old}).", "row": row.row_number, "column": f"Round {number}"})
+                if old == team: unchanged_picks += 1
+                else:
+                    new_picks += 1
+                    picks_plan.append({"season": season, "normalised_label": row.normalised_label, "round_number": number, "team": team, "source": "competition_csv"})
+                combined[number] = team
+                if family_entry_id:
+                    current = primary.get((family_entry_id, number))
+                    if current and current != team:
+                        issues.append({"severity": "error", "message": f"Conflicts with the family entry's recorded Round {number} primary pick ({current}).", "row": row.row_number, "column": f"Round {number}"})
+                    elif not current:
+                        family_selections.append({"entry_id": family_entry_id, "round_number": number, "team": team, "is_backup": False, "selected_at": datetime.now(timezone.utc).isoformat(), "result": "pending", "source": "competition_csv"})
+            inverse: dict[str, int] = {}
+            for number, team in combined.items():
+                if team in inverse and inverse[team] != number:
+                    issues.append({"severity": "error", "message": f"{team} is reused between recorded Round {inverse[team]} and Round {number}.", "row": row.row_number, "column": "Entry"})
+                inverse[team] = number
+        proposed = []
+        eliminated_family_ids: list[str] = []
+        if complete_list:
+            for label, prior in existing.items():
+                if bool(prior.get("active", True)) and label not in seen:
+                    proposed.append(str(prior["display_label"]))
+                    entries_plan.append({**prior, "active": False, "eliminated_round": reporting_round, "eliminated_at": datetime.now(timezone.utc).isoformat()})
+                    if prior.get("family_entry_id"): eliminated_family_ids.append(str(prior["family_entry_id"]))
+        # A partial upload does not replace the field. Build the effective
+        # post-import state before reporting counts.
+        effective_entries = dict(existing)
+        effective_entries.update({str(entry["normalised_label"]): entry for entry in entries_plan})
+        mapped_rows = {label: entry.get("family_entry_id") for label, entry in effective_entries.items() if entry.get("active")}
+        unlinked = [entry.entry_id for entry in entries_by_id.values() if entry.active and entry.entry_id not in set(mapped_rows.values())]
+        if unlinked:
+            issues.append({"severity": "warning", "message": f"{len(unlinked)} active family entr{'y is' if len(unlinked) == 1 else 'ies are'} not linked to a competition row.", "row": None, "column": None})
+        active_rows = [entry for entry in effective_entries.values() if entry.get("active")]
+        family_alive = len([entry for entry in active_rows if entry.get("family_entry_id")])
+        outside_alive = len(active_rows) - family_alive
+        previous_snapshot = self.wider_field(season, reporting_round)
+        wider_field = {"season": season, "round_number": reporting_round, "starting_entries": previous_snapshot.starting_entries if previous_snapshot else None, "surviving_entries": outside_alive, "known_selections": None, "recorded_at": datetime.now(timezone.utc).isoformat(), "source": "competition_csv", "observation": "initial observed surviving field" if latest_round is None else "organiser survivor list"} if complete_list else None
+        token = hashlib.sha256((parsed.checksum + "|" + season + "|" + str(reporting_round) + "|" + str(complete_list) + "|" + repr(sorted(family_links.items())) + "|" + str(self.repo.audit_revision())).encode()).hexdigest()
+        errors = [issue for issue in issues if issue["severity"] == "error"]
+        return {
+            "token": token, "revision": self.repo.audit_revision(), "checksum": parsed.checksum, "season": season, "reporting_round": reporting_round, "complete_list": complete_list, "family_links": family_links,
+            "issues": issues, "has_errors": bool(errors), "already_applied": already_applied,
+            "summary": {"entries_in_file": len(parsed.rows), "family_entries_matched": sum(1 for row in parsed.rows if (existing.get(row.normalised_label, {}).get("family_entry_id") or family_links.get(row.normalised_label))), "outside_entries": len(parsed.rows) - sum(1 for row in parsed.rows if (existing.get(row.normalised_label, {}).get("family_entry_id") or family_links.get(row.normalised_label))), "new_picks": new_picks, "unchanged_picks": unchanged_picks, "proposed_eliminations": proposed, "total_competition_entries_alive": len(active_rows), "family_entries_alive": family_alive, "outside_entries_alive": outside_alive, "unlinked_family_entry_ids": unlinked},
+            "_plan": {"entries": entries_plan, "picks": picks_plan, "family_selections": family_selections, "eliminated_family_entry_ids": eliminated_family_ids, "wider_field": wider_field},
+        }
+
+    def apply_competition_import(self, raw: bytes, preview: dict[str, object], confirm_eliminations: bool = False) -> dict[str, object]:
+        fresh = self.competition_import_preview(raw, str(preview["season"]), int(preview["reporting_round"]), bool(preview["complete_list"]), dict(preview.get("family_links", {})))
+        if fresh["token"] != preview.get("token"):
+            raise ValueError("The competition data changed after preview. Generate a new preview before confirming.")
+        if fresh["has_errors"]:
+            raise ValueError("Resolve the CSV conflicts before confirming the import.")
+        proposed = fresh["summary"]["proposed_eliminations"]
+        if proposed and not confirm_eliminations:
+            raise ValueError("Confirm the proposed eliminations from the complete organiser list before importing.")
+        if fresh["already_applied"]:
+            return {"already_applied": True, "summary": fresh["summary"]}
+        uploaded_at = datetime.now(timezone.utc).isoformat()
+        import_record = {"checksum": fresh["checksum"], "raw_file": f"competition_imports/{fresh['checksum']}.csv", "season": fresh["season"], "reporting_round": fresh["reporting_round"], "complete_list": fresh["complete_list"], "family_links": fresh["family_links"], "validation_findings": fresh["issues"], "summary": fresh["summary"], "uploaded_at": uploaded_at}
+        plan = dict(fresh["_plan"]); plan.update({"uploaded_at": uploaded_at, "import_record": import_record})
+        # Store content under its checksum, outside Git-tracked data.  A write
+        # failure occurs before the database transaction, never half-applied.
+        raw_dir = self.repo.path.parent / "competition_imports"
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        raw_path = raw_dir / f"{fresh['checksum']}.csv"
+        if not raw_path.exists(): raw_path.write_bytes(raw)
+        self.repo.apply_competition_import(plan)
+        return {"already_applied": False, "summary": fresh["summary"], "checksum": fresh["checksum"]}
